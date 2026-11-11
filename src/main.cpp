@@ -808,8 +808,7 @@ void maintainWiFi() {
 
     Serial.println("Wi-Fi reconnect attempt...");
 
-    WiFi.disconnect(false, false);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.reconnect();
   }
 }
 
