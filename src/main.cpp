@@ -9,10 +9,15 @@
 #include <esp_system.h>
 
 // =====================================================
-// ESP32-S3 SMART UPS MONITOR v3.4
+// ESP32-S3 SMART UPS MONITOR
 // PlatformIO / Arduino
 // ADC calibration + Wi-Fi reconnect + OTA
+// System Diagnostics
 // =====================================================
+
+static const char* const FIRMWARE_VERSION = "v3.5";
+static const char* const BUILD_DATE = __DATE__;
+static const char* const BUILD_TIME = __TIME__;
 
 // Wi-Fi and OTA credentials
 #include "secrets.h"
@@ -147,7 +152,7 @@ const char* getResetReason();
 
 void sendData() {
   String json;
-  json.reserve(512);
+  json.reserve(768);
 
   json += "{";
 
@@ -188,6 +193,23 @@ void sendData() {
   // System diagnostics
   json += ",\"resetReason\":\"";
   json += getResetReason();
+  json += "\"";
+
+    // Free heap memory
+  json += ",\"freeHeap\":";
+  json += String(ESP.getFreeHeap());
+
+  // Firmware information
+  json += ",\"firmwareVersion\":\"";
+  json += FIRMWARE_VERSION;
+  json += "\"";
+
+  json += ",\"buildDate\":\"";
+  json += BUILD_DATE;
+  json += "\"";
+
+  json += ",\"buildTime\":\"";
+  json += BUILD_TIME;
   json += "\"";
 
   json += ",\"taps\":[";
@@ -370,7 +392,7 @@ h2 {
 
 <header>
   <h1>ESP32-S3 UPS Monitor</h1>
-  <p>Моніторинг резервного живлення · v3.4</p>
+  <p>Моніторинг резервного живлення · <span id="headerVersion">—</span></p>
 </header>
 
 <main class="wrap">
@@ -432,6 +454,21 @@ h2 {
   <div class="card">
     <div class="label">Причина перезапуску</div>
     <div id="resetReason" class="value">—</div>
+  </div>
+
+    <div class="card">
+    <div class="label">Вільна RAM</div>
+    <div id="freeHeap" class="value">—</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Версія прошивки</div>
+    <div id="firmwareVersion" class="value">—</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Дата компіляції</div>
+    <div id="buildDateTime" class="value">—</div>
   </div>
 
 </div>
@@ -660,6 +697,25 @@ async function update() {
     $('resetReason').textContent =
       d.resetReason || '—';
 
+          // Free heap memory
+    $('freeHeap').textContent =
+      typeof d.freeHeap === 'number'
+        ? (d.freeHeap / 1024).toFixed(1) + ' КБ'
+        : '—';
+
+    // Firmware version
+    $('firmwareVersion').textContent =
+      d.firmwareVersion || '—';
+
+    $('headerVersion').textContent =
+      d.firmwareVersion || '—';
+
+    // Build date and time
+    $('buildDateTime').textContent =
+      d.buildDate && d.buildTime
+        ? d.buildDate + ' ' + d.buildTime
+        : '—';
+
     const cellBox = $('cells');
     cellBox.replaceChildren();
 
@@ -882,7 +938,14 @@ void setup() {
 
   Serial.println();
   Serial.println("==============================");
-  Serial.println("ESP32-S3 UPS Monitor v3.4");
+  Serial.print("ESP32-S3 UPS Monitor ");
+  Serial.println(FIRMWARE_VERSION);
+
+  Serial.print("Build: ");
+  Serial.print(BUILD_DATE);
+  Serial.print(" ");
+  Serial.println(BUILD_TIME);
+
   Serial.println("==============================");
 
   // ADC
