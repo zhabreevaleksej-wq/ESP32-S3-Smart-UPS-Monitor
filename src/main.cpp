@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <math.h>
+#include <esp_system.h>
 
 // =====================================================
 // ESP32-S3 SMART UPS MONITOR v3.4
@@ -142,9 +143,11 @@ void sampleSensors() {
 // JSON API
 // =====================================================
 
+const char* getResetReason();
+
 void sendData() {
   String json;
-  json.reserve(440);
+  json.reserve(512);
 
   json += "{";
 
@@ -179,8 +182,13 @@ void sendData() {
     WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0
   );
 
-  json += ",\"uptimeSeconds\":";
+   json += ",\"uptimeSeconds\":";
   json += String(millis() / 1000UL);
+
+  // System diagnostics
+  json += ",\"resetReason\":\"";
+  json += getResetReason();
+  json += "\"";
 
   json += ",\"taps\":[";
   for (int i = 0; i < 6; ++i) {
@@ -421,6 +429,13 @@ h2 {
     <div id="uptime" class="value">—</div>
   </div>
 
+  <div class="card">
+    <div class="label">Причина перезапуску</div>
+    <div id="resetReason" class="value">—</div>
+  </div>
+
+</div>
+
 </div>
 
 <h2>Попередження</h2>
@@ -639,8 +654,11 @@ async function update() {
       (d.uptimeSeconds % 3600) / 60
     );
 
-    $('uptime').textContent =
+     $('uptime').textContent =
       hours + ' год ' + minutes + ' хв';
+
+    $('resetReason').textContent =
+      d.resetReason || '—';
 
     const cellBox = $('cells');
     cellBox.replaceChildren();
@@ -815,6 +833,48 @@ void maintainWiFi() {
 // =====================================================
 // SETUP
 // =====================================================
+
+
+// ======================================================
+// SYSTEM DIAGNOSTICS — RESET REASON
+// ======================================================
+
+const char* getResetReason() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:
+            return "Power on";
+
+        case ESP_RST_EXT:
+            return "External reset";
+
+        case ESP_RST_SW:
+            return "Software reset";
+
+        case ESP_RST_PANIC:
+            return "System panic";
+
+        case ESP_RST_INT_WDT:
+            return "Interrupt watchdog";
+
+        case ESP_RST_TASK_WDT:
+            return "Task watchdog";
+
+        case ESP_RST_WDT:
+            return "Watchdog reset";
+
+        case ESP_RST_DEEPSLEEP:
+            return "Deep sleep wakeup";
+
+        case ESP_RST_BROWNOUT:
+            return "Brownout";
+
+        case ESP_RST_SDIO:
+            return "SDIO reset";
+
+        default:
+            return "Unknown";
+    }
+}
 
 void setup() {
   Serial.begin(115200);
