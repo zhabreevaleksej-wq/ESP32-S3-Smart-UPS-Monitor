@@ -473,7 +473,6 @@ h2 {
 
 </div>
 
-</div>
 
 <h2>Попередження</h2>
 <div id="alerts" class="card muted">
