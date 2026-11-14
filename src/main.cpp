@@ -4,7 +4,7 @@
 #include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <Wire.h>
-#include <Adafruit_INA219.h>
+#include <INA226.h>
 #include <math.h>
 #include <esp_system.h>
 
@@ -15,7 +15,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.5";
+static const char* const FIRMWARE_VERSION = "v3.6";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -23,8 +23,8 @@ static const char* const BUILD_TIME = __TIME__;
 #include "secrets.h"
 
 // Hardware pins
-constexpr uint8_t SDA_PIN = 15;
-constexpr uint8_t SCL_PIN = 16;
+constexpr uint8_t SDA_PIN = 16;
+constexpr uint8_t SCL_PIN = 15;
 
 constexpr uint8_t TAP_PINS[6] = {
   4, 5, 6, 7, 8, 9
@@ -48,7 +48,7 @@ constexpr uint32_t WIFI_RETRY_MS = 15000;
 
 // Objects
 WebServer server(80);
-Adafruit_INA219 ina219;
+INA226 ina226(0x40);
 
 // Measurement state
 bool inaOK = false;
@@ -138,9 +138,9 @@ void sampleSensors() {
   }
 
   if (inaOK) {
-    busV = ina219.getBusVoltage_V();
-    currentMA = ina219.getCurrent_mA();
-    powerMW = ina219.getPower_mW();
+    busV = ina226.getBusVoltage();
+    currentMA = ina226.getCurrent_mA();
+    powerMW = ina226.getPower_mW();
   }
 }
 
@@ -432,7 +432,7 @@ h2 {
   </div>
 
   <div class="card">
-    <div class="label">Шина INA219</div>
+    <div class="label">Шина INA226</div>
     <div id="bus" class="value">—</div>
   </div>
 
@@ -955,17 +955,24 @@ void setup() {
     pinMode(p, INPUT);
   }
 
-  // I2C
+   // I2C
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  // Optional INA219
-  inaOK = ina219.begin(&Wire);
+  // Optional INA226
+  inaOK = ina226.begin();
 
   if (inaOK) {
-    ina219.setCalibration_32V_2A();
-    Serial.println("INA219 OK");
+    int calibrationResult =
+        ina226.setMaxCurrentShunt(3.0, 0.01, false);
+
+    if (calibrationResult == 0) {
+      Serial.println("INA226 OK");
+    } else {
+      inaOK = false;
+      Serial.println("INA226 CALIBRATION ERROR");
+    }
   } else {
-    Serial.println("INA219 NOT FOUND");
+    Serial.println("INA226 NOT FOUND");
   }
 
   sampleSensors();
