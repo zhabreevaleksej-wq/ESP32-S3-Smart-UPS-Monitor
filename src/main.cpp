@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <Wire.h>
 #include <INA226.h>
+#include <LittleFS.h>
 #include <math.h>
 #include <esp_system.h>
 
@@ -61,6 +62,7 @@ INA226 ina226(0x40);
 
 // Measurement state
 bool inaOK = false;
+bool littlefsMounted = false;
 
 float taps[6] = {};
 float cells[6] = {};
@@ -277,6 +279,16 @@ void sendData() {
     // Free heap memory
   json += ",\"freeHeap\":";
   json += String(ESP.getFreeHeap());
+
+      // LittleFS diagnostics
+  json += ",\"littlefs_mounted\":";
+  json += (littlefsMounted ? "true" : "false");
+
+  json += ",\"littlefs_total\":";
+  json += String(littlefsMounted ? LittleFS.totalBytes() : 0);
+
+  json += ",\"littlefs_used\":";
+  json += String(littlefsMounted ? LittleFS.usedBytes() : 0);
 
   // Firmware information
   json += ",\"firmwareVersion\":\"";
@@ -1031,6 +1043,19 @@ const char* getResetReason() {
 void setup() {
   Serial.begin(115200);
   delay(1200);
+
+    // LittleFS: mount existing filesystem without formatting
+  littlefsMounted = LittleFS.begin(false, "/littlefs", 10, "spiffs");
+
+if (littlefsMounted) {
+    Serial.println("LittleFS mounted successfully");
+    Serial.printf("LittleFS total: %u bytes\n",
+                  (unsigned)LittleFS.totalBytes());
+    Serial.printf("LittleFS used: %u bytes\n",
+                  (unsigned)LittleFS.usedBytes());
+  } else {
+    Serial.println("LittleFS mount failed - formatting disabled");
+  }
 
   Serial.println();
   Serial.println("==============================");
