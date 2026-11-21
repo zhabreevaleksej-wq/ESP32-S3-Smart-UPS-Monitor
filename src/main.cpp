@@ -15,7 +15,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.6";
+static const char* const FIRMWARE_VERSION = "v3.7";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -25,6 +25,15 @@ static const char* const BUILD_TIME = __TIME__;
 // Hardware pins
 constexpr uint8_t SDA_PIN = 16;
 constexpr uint8_t SCL_PIN = 15;
+
+// Adapter-presence divider: YX850 DC+ -> 100 kOhm -> GPIO10 -> 20 kOhm -> OUT-.
+// This measures adapter INPUT presence, not the actual YX850 relay position.
+constexpr uint8_t ADAPTER_SENSE_PIN = 10;
+constexpr float ADAPTER_DIVIDER_RATIO = (100.0f + 20.0f) / 20.0f; // 6:1
+constexpr float ADAPTER_ON_THRESHOLD_V = 1.20f;  // ADC pin volts
+constexpr float ADAPTER_OFF_THRESHOLD_V = 0.65f; // ADC pin volts
+constexpr uint8_t SOURCE_CONFIRM_SAMPLES = 2;
+
 
 constexpr uint8_t TAP_PINS[6] = {
   4, 5, 6, 7, 8, 9
@@ -64,6 +73,15 @@ float busV = 0.0f;
 float currentMA = 0.0f;
 float powerMW = 0.0f;
 
+// Power-source indication is inferred from adapter voltage only.
+enum class AdapterState : uint8_t { Unknown, Present, Absent };
+AdapterState adapterState = AdapterState::Unknown;
+AdapterState pendingAdapterState = AdapterState::Unknown;
+uint8_t pendingAdapterSamples = 0;
+float adapterSenseV = 0.0f;
+float adapterInputV = 0.0f; // Approximate: divider resistor/ADC tolerance
+
+
 // Timers
 uint32_t lastSample = 0;
 uint32_t lastWifiAttempt = 0;
@@ -94,6 +112,54 @@ float readTap(uint8_t channel) {
       (sum / 24.0f) / 1000.0f;
 
   return adcVoltage * TAP_RATIO[channel];
+}
+
+// =====================================================
+// ADAPTER INPUT SENSING (GPIO10 / ADC1)
+// =====================================================
+
+void sampleAdapterInput() {
+  // Discard the first ADC conversion after changing channels.
+  analogReadMilliVolts(ADAPTER_SENSE_PIN);
+  delay(2);
+
+  uint32_t sumMV = 0;
+  for (int j = 0; j < 24; ++j) {
+    sumMV += analogReadMilliVolts(ADAPTER_SENSE_PIN);
+    delay(1);
+  }
+
+  adapterSenseV = (sumMV / 24.0f) / 1000.0f;
+  adapterInputV = adapterSenseV * ADAPTER_DIVIDER_RATIO;
+
+  // Hysteresis: ignore readings between the two thresholds.
+  AdapterState observed = AdapterState::Unknown;
+  if (adapterSenseV >= ADAPTER_ON_THRESHOLD_V) {
+    observed = AdapterState::Present;
+  } else if (adapterSenseV <= ADAPTER_OFF_THRESHOLD_V) {
+    observed = AdapterState::Absent;
+  }
+
+  if (observed == AdapterState::Unknown || observed == adapterState) {
+    pendingAdapterState = AdapterState::Unknown;
+    pendingAdapterSamples = 0;
+    return;
+  }
+
+  if (observed != pendingAdapterState) {
+    pendingAdapterState = observed;
+    pendingAdapterSamples = 1;
+  } else if (pendingAdapterSamples < SOURCE_CONFIRM_SAMPLES) {
+    ++pendingAdapterSamples;
+  }
+
+  if (pendingAdapterSamples >= SOURCE_CONFIRM_SAMPLES) {
+    adapterState = observed;
+    pendingAdapterState = AdapterState::Unknown;
+    pendingAdapterSamples = 0;
+    Serial.println(adapterState == AdapterState::Present
+      ? "Adapter input: PRESENT" : "Adapter input: ABSENT");
+  }
 }
 
 // =====================================================
@@ -137,6 +203,8 @@ void sampleSensors() {
     }
   }
 
+  sampleAdapterInput();
+
   if (inaOK) {
     busV = ina226.getBusVoltage();
     currentMA = ina226.getCurrent_mA();
@@ -176,6 +244,17 @@ void sendData() {
 
   json += ",\"powerMW\":";
   json += String(powerMW, 2);
+
+  json += ",\"adapterSenseVoltage\":";
+  json += String(adapterSenseV, 3);
+
+  json += ",\"adapterInputVoltage\":";
+  json += String(adapterInputV, 2);
+
+  json += ",\"powerSource\":\"";
+  json += adapterState == AdapterState::Present ? "adapter" :
+          adapterState == AdapterState::Absent ? "battery" : "unknown";
+  json += "\"";
 
   json += ",\"wifiConnected\":";
   json += (
@@ -402,6 +481,13 @@ h2 {
 </div>
 
 <div class="grid">
+
+  <div class="card">
+    <div class="label">Джерело живлення</div>
+    <div id="powerSource" class="value">Визначення...</div>
+    <div id="adapterVoltage" class="muted">Вхід DC+: —</div>
+    <div class="muted">За наявністю напруги адаптера, не за положенням реле YX850.</div>
+  </div>
 
   <div class="card">
     <div class="label">Напруга акумулятора</div>
@@ -636,6 +722,17 @@ async function update() {
     }
 
     const d = await r.json();
+
+    const sourceLabel = d.powerSource === 'adapter'
+      ? 'Адаптер 12 В'
+      : d.powerSource === 'battery'
+        ? 'Акумулятор'
+        : 'Визначення...';
+    $('powerSource').textContent = sourceLabel;
+    $('adapterVoltage').textContent =
+      typeof d.adapterInputVoltage === 'number'
+        ? 'Вхід DC+: ≈ ' + d.adapterInputVoltage.toFixed(2) + ' В'
+        : 'Вхід DC+: —';
 
     $('status').textContent =
       d.batteryValid
@@ -954,6 +1051,7 @@ void setup() {
   for (uint8_t p : TAP_PINS) {
     pinMode(p, INPUT);
   }
+  pinMode(ADAPTER_SENSE_PIN, INPUT);
 
    // I2C
   Wire.begin(SDA_PIN, SCL_PIN);
