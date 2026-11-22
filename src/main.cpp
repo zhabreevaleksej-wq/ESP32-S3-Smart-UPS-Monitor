@@ -17,7 +17,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.9-dev4";
+static const char* const FIRMWARE_VERSION = "v3.9-dev5";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -85,7 +85,7 @@ uint32_t lastEnergySaveMs = 0;
 bool lastEnergyValid = false;
 float lastEnergyPowerW = 0.0f;
 
-// Outage statistics (v3.9-dev4): confirmed adapter absence, not relay position.
+// Outage statistics (v3.9-dev5): confirmed adapter absence, not relay position.
 // Times are measured while the ESP32 is running; downtime during resets is unknown.
 constexpr const char* OUTAGE_FILE = "/outages.txt";
 constexpr const char* OUTAGE_TEMP_FILE = "/outages.tmp";
@@ -156,6 +156,110 @@ uint32_t lastWifiAttempt = 0;
 // Network state
 bool wifiWasConnected = false;
 bool otaStarted = false;
+
+// v3.9-dev5: completed outage journal, independent of v3.9-dev4 totals.
+// CSV epoch timestamps are UTC; the browser formats them for Europe/Kyiv.
+constexpr const char* OUTAGE_LOG_FILE = "/outages.csv";
+constexpr const char* OUTAGE_LOG_TEMP = "/outages_csv.tmp";
+constexpr const char* OUTAGE_PENDING_FILE = "/outage_pending.txt";
+constexpr const char* OUTAGE_PENDING_TEMP = "/outage_pending.tmp";
+constexpr const char* OUTAGE_CSV_HEADER = "start_epoch,end_epoch,measured_seconds,status\n";
+constexpr size_t MAX_OUTAGE_LOG_RECORDS = 200;
+uint32_t outageStartEpoch = 0;
+uint32_t outageStartMillis = 0;
+bool outageStartKnown = false;
+bool outageInterrupted = false;
+bool outagePendingExists = false;
+size_t outageLogCount = 0;
+
+// This metadata is written at loss and read at reboot. Duration comes from
+// the existing v3.9-dev4 measured counter; no time is invented during resets.
+bool savePendingOutage() {
+  if (!littlefsMounted) return false;
+  File f = LittleFS.open(OUTAGE_PENDING_TEMP, "w");
+  if (!f) return false;
+  String payload = String(outageStartEpoch) + "\n" +
+      String(outageInterrupted ? 1 : 0) + "\n";
+  bool ok = f.print(payload) == payload.length();
+  if (ok) { f.flush(); ok = !f.getWriteError(); }
+  f.close();
+  if (!ok) { LittleFS.remove(OUTAGE_PENDING_TEMP); return false; }
+  if (!LittleFS.rename(OUTAGE_PENDING_TEMP, OUTAGE_PENDING_FILE)) return false;
+  outagePendingExists = true;
+  return true;
+}
+
+void loadPendingOutage() {
+  if (!littlefsMounted || !LittleFS.exists(OUTAGE_PENDING_FILE)) return;
+  File f = LittleFS.open(OUTAGE_PENDING_FILE, "r");
+  if (!f) return;
+  String start = f.readStringUntil('\n');
+  String interrupted = f.readStringUntil('\n');
+  f.close();
+  start.trim(); interrupted.trim();
+  outageStartEpoch = (uint32_t)strtoul(start.c_str(), nullptr, 10);
+  outageStartKnown = outageStartEpoch >= 1735689600UL;
+  outageInterrupted = true; // Any reboot during an open episode makes it partial.
+  outagePendingExists = true;
+}
+
+void initializeOutageJournal() {
+  outageLogCount = 0;
+  if (!littlefsMounted) return;
+  File f = LittleFS.open(OUTAGE_LOG_FILE, "r");
+  if (!f) return;
+  while (f.available()) {
+    String row = f.readStringUntil('\n');
+    row.trim();
+    if (row.length() && !row.startsWith("start_epoch,")) ++outageLogCount;
+  }
+  f.close();
+}
+
+bool compactOutageJournal() {
+  if (outageLogCount <= MAX_OUTAGE_LOG_RECORDS) return true;
+  File src = LittleFS.open(OUTAGE_LOG_FILE, "r");
+  if (!src) return false;
+  LittleFS.remove(OUTAGE_LOG_TEMP);
+  File dst = LittleFS.open(OUTAGE_LOG_TEMP, "w");
+  if (!dst) { src.close(); return false; }
+  const size_t skip = outageLogCount - MAX_OUTAGE_LOG_RECORDS;
+  size_t seen = 0;
+  bool ok = dst.print(OUTAGE_CSV_HEADER) == strlen(OUTAGE_CSV_HEADER);
+  while (ok && src.available()) {
+    String row = src.readStringUntil('\n');
+    row.trim();
+    if (!row.length() || row.startsWith("start_epoch,")) continue;
+    if (seen++ < skip) continue;
+    if (dst.println(row) != row.length() + 2) ok = false;
+  }
+  if (ok) { dst.flush(); ok = !dst.getWriteError(); }
+  dst.close(); src.close();
+  if (!ok) { LittleFS.remove(OUTAGE_LOG_TEMP); return false; }
+  if (!LittleFS.rename(OUTAGE_LOG_TEMP, OUTAGE_LOG_FILE)) return false;
+  outageLogCount = MAX_OUTAGE_LOG_RECORDS;
+  return true;
+}
+
+bool appendCompletedOutage(uint32_t endEpoch) {
+  if (!littlefsMounted) return false;
+  // Keep a missing start/end as 0 rather than presenting an invented date.
+  const String status = outageInterrupted ? "partial_reset" :
+      (!outageStartKnown || endEpoch == 0 ? "time_unknown" : "complete");
+  const String row = String(outageStartKnown ? outageStartEpoch : 0) + "," +
+      String(endEpoch) + "," + String((unsigned long)(outageLastMs / 1000ULL)) + "," + status + "\n";
+  File f = LittleFS.open(OUTAGE_LOG_FILE, "a");
+  if (!f) return false;
+  bool ok = true;
+  if (f.size() == 0) ok = f.print(OUTAGE_CSV_HEADER) == strlen(OUTAGE_CSV_HEADER);
+  if (ok) ok = f.print(row) == row.length();
+  if (ok) { f.flush(); ok = !f.getWriteError(); }
+  f.close();
+  if (!ok) return false;
+  ++outageLogCount;
+  if (!compactOutageJournal()) Serial.println("OUTAGE JOURNAL: Compaction deferred");
+  return true;
+}
 
 // File stores completed and ongoing measured durations separately. A reboot
 // during an outage resumes the counter without inventing the offline interval.
@@ -240,6 +344,7 @@ float readTap(uint8_t channel) {
 // ADAPTER INPUT SENSING (GPIO10 / ADC1)
 // =====================================================
 
+bool isTimeValid();
 bool appendEvent(const char* eventType);
 bool savePowerState(AdapterState state);
 
@@ -318,6 +423,19 @@ void sampleAdapterInput() {
         ++outageCount;
         outageActiveMs = 0;
       }
+      if (previousState != AdapterState::Unknown || savedAdapterState != AdapterState::Absent) {
+        outageStartEpoch = isTimeValid() ? (uint32_t)time(nullptr) : 0;
+        outageStartKnown = outageStartEpoch != 0;
+        outageStartMillis = millis();
+        outageInterrupted = previousState == AdapterState::Unknown;
+        if (!savePendingOutage()) Serial.println("OUTAGE JOURNAL: Pending start save failed");
+      } else if (!outagePendingExists) {
+        // Existing v3.9-dev4 outage upgraded while already on battery.
+        outageStartEpoch = 0;
+        outageStartKnown = false;
+        outageInterrupted = true;
+        savePendingOutage();
+      }
       if (!saveOutageStats()) Serial.println("OUTAGES: Save after loss failed");
     } else if (adapterState == AdapterState::Present &&
                (previousState == AdapterState::Absent ||
@@ -325,6 +443,17 @@ void sampleAdapterInput() {
       outageLastMs = outageActiveMs;
       if (outageLastMs > outageLongestMs) outageLongestMs = outageLastMs;
       outageActiveMs = 0;
+      // If NTP became available during the same boot, reconstruct the start
+      // from monotonic millis only when no reset interrupted the episode.
+      const uint32_t endEpoch = isTimeValid() ? (uint32_t)time(nullptr) : 0;
+      if (!outageStartKnown && !outageInterrupted && endEpoch) {
+        outageStartEpoch = endEpoch - (uint32_t)((millis() - outageStartMillis) / 1000UL);
+        outageStartKnown = true;
+      }
+      if (appendCompletedOutage(endEpoch)) {
+        LittleFS.remove(OUTAGE_PENDING_FILE);
+        outagePendingExists = false;
+      } else Serial.println("OUTAGE JOURNAL: Append failed; pending retained");
       if (!saveOutageStats()) Serial.println("OUTAGES: Save after restore failed");
     }
 
@@ -816,7 +945,7 @@ void accumulateMeasurement() {
 }
 
 // =====================================================
-// ENERGY ACCOUNTING (v3.9-dev4)
+// ENERGY ACCOUNTING (v3.9-dev5)
 // =====================================================
 void loadEnergyCounters() {
   if (!littlefsMounted) return;
@@ -1017,7 +1146,7 @@ json += String((uint32_t)time(nullptr));
 
 const char PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3 UPS Monitor v3.9-dev4</title>
+<title>ESP32-S3 UPS Monitor v3.9-dev5</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,Arial,sans-serif}*{box-sizing:border-box}
 body{margin:0;background:#0b1220;color:#e8f0ff;font-size:14px}
@@ -1043,7 +1172,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 .historycontrols{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:10px 0}.historycontrols button{background:#203957;color:#e8f0ff;border:1px solid #486587;border-radius:8px;padding:8px 12px;cursor:pointer}.historycontrols button.selected{background:#34577d;border-color:#80c7ff}.historychart{height:205px;width:100%;display:block}.historycharts{display:grid;grid-template-columns:1fr;gap:10px}.systemgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.cellgrid{grid-template-columns:repeat(3,minmax(0,1fr))}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:600px){.wrap{padding:8px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}.chart{height:105px}.source strong{font-size:16px}.cellitem strong{font-size:14px}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.9-dev4</span></p></header>
+</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.9-dev5</span></p></header>
 <nav class="tabs" aria-label="Вкладки"><button class="tab active" data-tab="main">Головна</button><button class="tab" data-tab="events">Журнал</button><button class="tab" data-tab="history">Історія</button><button class="tab" data-tab="system">Система</button></nav>
 <section id="panel-main" class="panel active">
 <div class="card source"><div><div class="label">Поточне джерело живлення (за входом адаптера)</div><strong id="powerSource">Визначення...</strong><small id="lastSwitch">Останнє перемикання: —</small></div><div id="adapterVoltage" class="muted">DC+: —</div></div>
@@ -1065,15 +1194,23 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 <p class="foot">Графіки зберігаються лише в браузері. Без BMS вебмоніторинг не запобігає перерозряду. Джерело визначається за напругою DC+, а не положенням реле YX850.</p>
 </section>
 <section id="panel-events" class="panel"><h2>Журнал подій живлення</h2><p class="muted">≈ — приблизний час відключення, визначений після запуску ESP32 та синхронізації NTP.</p><div class="tablewrap"><table><thead><tr><th>Дата та час</th><th>Подія</th></tr></thead><tbody id="events"><tr><td colspan="2">Завантаження...</td></tr></tbody></table></div></section>
-<section id="panel-history" class="panel"><h2>Історія вимірювань (LittleFS)</h2><div class="grid" style="margin-bottom:12px"><div class="card"><div class="label">Енергія від адаптера (накопичено)</div><div class="value" id="adapterWh">—</div></div><div class="card"><div class="label">Енергія від акумулятора (накопичено)</div><div class="value" id="batteryWh">—</div></div></div><p class="muted">Лічильники Wh ведуться з моменту першого запуску v3.9-dev4; збереження приблизно кожні 5 хвилин. Останні хвилини можуть втратитися при раптовому знеструмленні.</p><p class="muted">Усереднені показники приблизно кожні 5 хвилин. Графіки будуються за збереженим CSV, а не за пам'яттю браузера.</p>
+<section id="panel-history" class="panel"><h2>Історія вимірювань (LittleFS)</h2><div class="grid" style="margin-bottom:12px"><div class="card"><div class="label">Енергія від адаптера (накопичено)</div><div class="value" id="adapterWh">—</div></div><div class="card"><div class="label">Енергія від акумулятора (накопичено)</div><div class="value" id="batteryWh">—</div></div></div><p class="muted">Лічильники Wh ведуться з моменту першого запуску v3.9-dev5; збереження приблизно кожні 5 хвилин. Останні хвилини можуть втратитися при раптовому знеструмленні.</p><p class="muted">Усереднені показники приблизно кожні 5 хвилин. Графіки будуються за збереженим CSV, а не за пам'яттю браузера.</p>
 <h2>Статистика відключень адаптера</h2>
 <div class="systemgrid" style="margin-bottom:12px">
 <div class="card"><div class="label">Кількість відключень</div><div class="value" id="outageCount">—</div></div>
 <div class="card"><div class="label">Останнє завершене відключення</div><div class="value" id="outageLast">—</div></div>
 <div class="card"><div class="label">Загальний час без адаптера</div><div class="value" id="outageTotal">—</div></div>
 <div class="card"><div class="label">Найдовше завершене відключення</div><div class="value" id="outageLongest">—</div></div>
-</div><p class="muted">Тривалість враховується лише під час роботи ESP32; час перезавантаження невідомий. Статистика починається з v3.9-dev4. Активне відключення враховується в загальному часі, але до завершення не входить до показників останнього та найдовшого.</p>
-<div class="historycontrols"><button type="button" data-range="1" class="selected">1 година</button><button type="button" data-range="24">24 години</button><button type="button" data-range="168">7 днів</button><button type="button" id="reloadHistory">Оновити</button></div>
+</div><p class="muted">Тривалість враховується лише під час роботи ESP32; час перезавантаження невідомий. Статистика починається з v3.9-dev5. Активне відключення враховується в загальному часі, але до завершення не входить до показників останнього та найдовшого.</p>
+<details id="outagesDetails" class="card" style="margin:12px 0 14px">
+ <summary style="cursor:pointer;font-weight:700">Журнал завершених відключень <span id="outagesCountLabel" class="muted">(завантаження...)</span></summary>
+ <p class="muted">Тільки завершені події. «Неповний час» означає перезапуск ESP32 під час відключення; показано лише підтверджений час роботи. Часові позначки без NTP не вигадуються.</p>
+ <div class="historycontrols"><button type="button" id="reloadOutages">Оновити журнал</button><a href="/api/outages.csv" download="outages.csv" style="color:#80c7ff">Завантажити CSV</a></div>
+ <p id="outagesStatus" class="muted">Журнал ще не завантажено.</p>
+ <div class="tablewrap"><table><thead><tr><th>Початок</th><th>Відновлення</th><th>Підтверджена тривалість</th><th>Примітка</th></tr></thead><tbody id="outagesRows"><tr><td colspan="4">Немає даних</td></tr></tbody></table></div>
+ <div class="historycontrols"><button type="button" id="moreOutages" hidden>Показати ще 10</button></div>
+</details>
+ <div class="historycontrols"><button type="button" data-range="1" class="selected">1 година</button><button type="button" data-range="24">24 години</button><button type="button" data-range="168">7 днів</button><button type="button" id="reloadHistory">Оновити</button></div>
 <p id="historyStatus" class="muted" aria-live="polite">Відкрийте вкладку, щоб завантажити історію.</p>
 <div class="historycharts"><div class="card"><div class="label">Напруга акумулятора, В</div><canvas id="historicBattery" class="historychart"></canvas></div><div class="card"><div class="label">Струм, мА</div><canvas id="historicCurrent" class="historychart"></canvas></div><div class="card"><div class="label">Потужність, Вт</div><canvas id="historicPower" class="historychart"></canvas></div></div>
 <p class="foot">Проміжки без записів не означають нульове споживання. Після зміни періоду показуються лише наявні вимірювання.</p></section>
@@ -1094,7 +1231,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 const $=id=>document.getElementById(id);
 let activeTab='main';let latestData=null;let events=[];let historicRows=[];let historicRangeHours=1;let historicLoaded=false;
 const history={v:[],i:[],p:[]};
-function setTab(tab){activeTab=tab;document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));if(tab==='main')drawCharts();if(tab==='events')updateEvents();if(tab==='history'){if(!historicLoaded)loadHistoricData();else drawHistoricCharts();}}
+function setTab(tab){activeTab=tab;document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));if(tab==='main')drawCharts();if(tab==='events')updateEvents();if(tab==='history'){loadOutages();if(!historicLoaded)loadHistoricData();else drawHistoricCharts();}}
 document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.tab)));
 function add(k,v){if(!Number.isFinite(v))return;history[k].push(v);if(history[k].length>60)history[k].shift();}
 function line(canvas,values){if(!canvas.clientWidth||!canvas.clientHeight)return;const dpr=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);c.strokeStyle='#38516f';c.lineWidth=1;for(let j=1;j<4;j++){let y=h*j/4;c.beginPath();c.moveTo(8,y);c.lineTo(w-8,y);c.stroke();}if(!values.length)return;let lo=Math.min(...values),hi=Math.max(...values);if(hi-lo<0.1){lo-=0.05;hi+=0.05;}c.strokeStyle='#55b5ff';c.lineWidth=2;c.beginPath();values.forEach((v,j)=>{const x=9+j*(w-18)/Math.max(1,values.length-1),y=h-10-(v-lo)/(hi-lo)*(h-20);if(!j)c.moveTo(x,y);else c.lineTo(x,y);});c.stroke();c.fillStyle='#aec4df';c.font='12px system-ui';c.fillText(hi.toFixed(2),10,13);c.fillText(lo.toFixed(2),10,h-3);}
@@ -1149,12 +1286,36 @@ function formatDate(sec){if(!(sec>0))return null;return new Date(sec*1000).toLoc
 function eventLabel(type){return type==='adapter_lost'?'Адаптер відключено — акумулятор':type==='adapter_restored'?'Адаптер підключено — мережа':type;}
 function renderLastSwitch(){const last=events[0];$('lastSwitch').textContent=last&&last.time>0?'Останнє перемикання: '+(last.approx?'≈ ':'')+formatDate(last.time):'Останнє перемикання: —';}
 async function updateEvents(){try{const r=await fetch('/api/events',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const csv=await r.text();events=csv.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>{const [time,type,flag]=x.split(',');return {time:Number(time),type,approx:flag==='approx'};}).reverse();renderLastSwitch();if(activeTab!=='events')return;const box=$('events');box.replaceChildren();if(!events.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=2;td.textContent='Подій поки немає.';tr.appendChild(td);box.appendChild(tr);return;}events.forEach(e=>{const tr=document.createElement('tr'),td1=document.createElement('td'),td2=document.createElement('td');td1.textContent=e.time>0?(e.approx?'≈ ':'')+formatDate(e.time):'Немає збереженого часу';td2.textContent=eventLabel(e.type);td2.className=e.type==='adapter_lost'?'warn':e.type==='adapter_restored'?'ok':'';tr.append(td1,td2);box.appendChild(tr);});}catch(e){console.error(e);if(activeTab==='events')$('events').textContent='Не вдалося завантажити журнал.';}}
+let outageEntries=[];let outageVisible=10;
+function renderOutages(){
+ const body=$('outagesRows'),status=$('outagesStatus');body.replaceChildren();
+ $('outagesCountLabel').textContent='('+outageEntries.length+' записів)';
+ status.textContent='Показано '+Math.min(outageVisible,outageEntries.length)+' із '+outageEntries.length+' завершених записів (максимум 200).';
+ if(!outageEntries.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.textContent='Завершених відключень у журналі поки немає.';tr.appendChild(td);body.appendChild(tr);}
+ outageEntries.slice(0,outageVisible).forEach(line=>{
+  const [a,b,d,flag]=line.split(','),tr=document.createElement('tr');
+  const cells=[formatDate(Number(a))||'Час невідомий',formatDate(Number(b))||'Час невідомий',durationText(Number(d)),flag==='partial_reset'?'Неповний час (перезапуск)':flag==='time_unknown'?'Час NTP недоступний':'Завершено'];
+  cells.forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.appendChild(td);});body.appendChild(tr);
+ });
+ $('moreOutages').hidden=outageVisible>=outageEntries.length;
+}
+async function loadOutages(){
+ const status=$('outagesStatus');
+ try{
+  const r=await fetch('/api/outages.csv',{cache:'no-store'});
+  if(!r.ok)throw Error('HTTP '+r.status);
+  outageEntries=(await r.text()).split(/\r?\n/).filter(x=>x.trim()&&!x.startsWith('start_epoch,')).reverse();
+  outageVisible=10;renderOutages();
+ }catch(e){status.textContent='Помилка завантаження журналу: '+e.message;}
+}
+$('reloadOutages').addEventListener('click',loadOutages);
+$('moreOutages').addEventListener('click',()=>{outageVisible+=10;renderOutages();});
 function tile(label,value,warning){const el=document.createElement('div');el.className='cellitem';const a=document.createElement('div');a.className='label';a.textContent=label;const b=document.createElement('strong');b.textContent=value;if(warning)b.className='warn';el.append(a,b);return el;}
 async function update(){try{const r=await fetch('/api/data',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();latestData=d;$('powerSource').textContent=d.powerSource==='adapter'?'Адаптер 12 В':d.powerSource==='battery'?'Акумулятор':'Визначення...';$('powerSource').className=d.powerSource==='adapter'?'ok':d.powerSource==='battery'?'warn':'';$('adapterVoltage').textContent='Вхід DC+: '+(typeof d.adapterInputVoltage==='number'?'≈ '+d.adapterInputVoltage.toFixed(2)+' В':'—');$('status').textContent=d.batteryValid?'Батарея: конфігурацію визначено':'Конфігурацію батареї не підтверджено';$('status').className='card notice '+(d.batteryValid?'ok':'warn');$('battery').textContent=d.batteryValid?d.batteryVoltage.toFixed(2)+' В':'—';$('bus').textContent=d.inaReady?d.busVoltage.toFixed(2)+' В':'—';$('current').textContent=d.inaReady?d.currentMA.toFixed(1)+' мА':'—';$('power').textContent=d.inaReady?(d.powerMW/1000).toFixed(2)+' Вт':'—';$('soc').textContent=d.batteryValid?approxSOC(d.batteryVoltage/d.detectedCells)+' %':'—';$('count').textContent=d.batteryValid?'· '+d.detectedCells+'S':'';
 const cellBox=$('cells');cellBox.replaceChildren();const vs=d.batteryValid?d.cells.slice(0,d.detectedCells):[];const imbalance=vs.length?Math.max(...vs)-Math.min(...vs):0;$('imbalance').textContent=vs.length?(imbalance*1000).toFixed(0)+' мВ':'—';if(vs.length){vs.forEach((v,i)=>{const el=tile('Комірка '+(i+1),v.toFixed(3)+' В',v<3.3||v>4.2);const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill'+(v<3.3||v>4.2?' warnfill':'');fill.style.width=Math.max(0,Math.min(100,v/4.2*100))+'%';track.appendChild(fill);el.appendChild(track);cellBox.appendChild(el);});}else cellBox.textContent='Немає підтверджених даних про комірки.';
 const tapBox=$('taps');tapBox.replaceChildren();d.taps.forEach((v,i)=>tapBox.appendChild(tile('B'+(i+1),v.toFixed(3)+' В')));
 const warnings=[];if(vs.some(v=>v<3.3))warnings.push('Низька напруга однієї або кількох комірок.');if(vs.some(v=>v>4.2))warnings.push('Напруга комірки перевищує 4,20 В.');if(imbalance>0.10)warnings.push('Різниця між комірками понад 100 мВ.');$('alerts').textContent=!d.batteryValid?'Перевір балансувальні канали.':warnings.length?warnings.join(' '):'Критичних відхилень за заданими порогами не виявлено.';
-$('outageCount').textContent=typeof d.outageCount==='number'?d.outageCount:'—';$('outageLast').textContent=durationText(d.outageLastSeconds);$('outageTotal').textContent=durationText(d.outageTotalSeconds);$('outageLongest').textContent=durationText(d.outageLongestSeconds);$('adapterWh').textContent=typeof d.adapterEnergyWh==='number'?d.adapterEnergyWh.toFixed(3)+' Wh':'—';$('batteryWh').textContent=typeof d.batteryEnergyWh==='number'?d.batteryEnergyWh.toFixed(3)+' Wh':'—';$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.9-dev4';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('historyRecords').textContent=typeof d.measurementRecords==='number'?d.measurementRecords+' / 2016':'—';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
+$('outageCount').textContent=typeof d.outageCount==='number'?d.outageCount:'—';$('outageLast').textContent=durationText(d.outageLastSeconds);$('outageTotal').textContent=durationText(d.outageTotalSeconds);$('outageLongest').textContent=durationText(d.outageLongestSeconds);$('adapterWh').textContent=typeof d.adapterEnergyWh==='number'?d.adapterEnergyWh.toFixed(3)+' Wh':'—';$('batteryWh').textContent=typeof d.batteryEnergyWh==='number'?d.batteryEnergyWh.toFixed(3)+' Wh':'—';$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.9-dev5';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('historyRecords').textContent=typeof d.measurementRecords==='number'?d.measurementRecords+' / 2016':'—';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
 }catch(e){$('status').textContent='Втрачено зв’язок з ESP32';$('status').className='card notice danger';console.error(e);}}
 update();updateEvents();setInterval(update,3000);setInterval(updateEvents,10000);
 </script></body></html>
@@ -1275,6 +1436,8 @@ if (littlefsMounted) {
 initializeMeasurementLog();
   loadEnergyCounters();
   loadOutageStats();
+  initializeOutageJournal();
+  loadPendingOutage();
   outageSaveMs = millis();
   lastEnergySaveMs = millis();
 
@@ -1402,6 +1565,21 @@ Serial.println("NTP synchronization configured");
                       "attachment; filename=\"measurements.csv\"");
     server.streamFile(file, "text/csv; charset=utf-8");
     file.close();
+  });
+
+  server.on("/api/outages.csv", HTTP_GET, []() {
+    if (!littlefsMounted) {
+      server.send(503, "text/plain; charset=utf-8", "LittleFS unavailable");
+      return;
+    }
+    File f = LittleFS.open(OUTAGE_LOG_FILE, "r");
+    server.sendHeader("Cache-Control", "no-store");
+    if (!f) {
+      server.send(200, "text/csv; charset=utf-8", OUTAGE_CSV_HEADER);
+      return;
+    }
+    server.streamFile(f, "text/csv; charset=utf-8");
+    f.close();
   });
 
   server.on("/api/events", HTTP_GET, []() {
