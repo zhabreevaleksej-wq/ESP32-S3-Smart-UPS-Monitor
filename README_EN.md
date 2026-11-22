@@ -4,6 +4,10 @@
 
 Experimental battery-backup monitoring for a Wi-Fi router and optical network unit (ONU), using ESP32-S3, INA226, a YX850 relay switch, and LM2596 DC-DC converters.
 
+### Live dashboard preview
+
+![ESP32-S3 Smart UPS Monitor v3.9 dashboard](docs/images/dashboard.png)
+
 ## Features
 
 - Four-tab local web dashboard: Home / Events / Analytics / System (UI text is Ukrainian).
@@ -26,3 +30,22 @@ Experimental battery-backup monitoring for a Wi-Fi router and optical network un
 ## Project documentation and license
 
 [Changelog](CHANGELOG.md) · [History](HISTORY.md) · [Release v3.9 notes](RELEASE_NOTES_v3.9.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [MIT License](LICENSE).
+## Web interface screenshots (v3.9)
+
+Actual captures from the ESP32-S3 Smart UPS Monitor v3.9 web UI on 22 November 2026. Displayed readings are examples from one test unit, not specifications for other hardware.
+
+### Home — live electrical readings
+
+![Home dashboard: battery, INA226, cells and charts](docs/images/dashboard.png)
+
+### Events — power transitions and outage history
+
+![Events journal and completed outages](docs/images/events.png)
+
+### Analytics — persistent LittleFS measurements
+
+![Analytics, historical charts and outage statistics](docs/images/analytics.png)
+
+### System — diagnostics
+
+![System status: INA226, Wi-Fi, memory, NTP and OTA](docs/images/system.png)
