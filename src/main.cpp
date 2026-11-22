@@ -8,6 +8,7 @@
 #include <LittleFS.h>
 #include <math.h>
 #include <esp_system.h>
+#include <time.h>
 
 // =====================================================
 // ESP32-S3 SMART UPS MONITOR
@@ -16,7 +17,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.7";
+static const char* const FIRMWARE_VERSION = "v3.8";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -55,6 +56,10 @@ constexpr float CELL_MAX_DETECT = 4.30f;
 
 constexpr uint32_t SAMPLE_INTERVAL_MS = 3000;
 constexpr uint32_t WIFI_RETRY_MS = 15000;
+// Event history limits
+constexpr size_t MAX_EVENT_RECORDS = 200;
+// Persistent power-source state
+constexpr const char* POWER_STATE_FILE = "/power_state.txt";
 
 // Objects
 WebServer server(80);
@@ -77,11 +82,17 @@ float powerMW = 0.0f;
 
 // Power-source indication is inferred from adapter voltage only.
 enum class AdapterState : uint8_t { Unknown, Present, Absent };
+
 AdapterState adapterState = AdapterState::Unknown;
 AdapterState pendingAdapterState = AdapterState::Unknown;
+AdapterState savedAdapterState = AdapterState::Unknown;
+
 uint8_t pendingAdapterSamples = 0;
 float adapterSenseV = 0.0f;
 float adapterInputV = 0.0f; // Approximate: divider resistor/ADC tolerance
+uint32_t pendingEventId = 0;
+uint32_t pendingEventMillis = 0;
+bool pendingEventTime = false;
 
 
 // Timers
@@ -120,6 +131,9 @@ float readTap(uint8_t channel) {
 // ADAPTER INPUT SENSING (GPIO10 / ADC1)
 // =====================================================
 
+bool appendEvent(const char* eventType);
+bool savePowerState(AdapterState state);
+
 void sampleAdapterInput() {
   // Discard the first ADC conversion after changing channels.
   analogReadMilliVolts(ADAPTER_SENSE_PIN);
@@ -156,11 +170,41 @@ void sampleAdapterInput() {
   }
 
   if (pendingAdapterSamples >= SOURCE_CONFIRM_SAMPLES) {
+    const AdapterState previousState = adapterState;
+
     adapterState = observed;
     pendingAdapterState = AdapterState::Unknown;
     pendingAdapterSamples = 0;
-    Serial.println(adapterState == AdapterState::Present
-      ? "Adapter input: PRESENT" : "Adapter input: ABSENT");
+
+    if (previousState == AdapterState::Unknown) {
+      // First confirmed measurement after boot: compare with LittleFS.
+      Serial.println(adapterState == AdapterState::Present
+        ? "EVENT: Initial state - adapter present"
+        : "EVENT: Initial state - adapter absent");
+
+      if (savedAdapterState == AdapterState::Present &&
+          adapterState == AdapterState::Absent) {
+        Serial.println("EVENT: Adapter input lost while restarting (inferred)");
+        appendEvent("adapter_lost");
+      } else if (savedAdapterState == AdapterState::Absent &&
+                 adapterState == AdapterState::Present) {
+        Serial.println("EVENT: Adapter input restored while restarting (inferred)");
+        appendEvent("adapter_restored");
+      }
+    } else if (adapterState == AdapterState::Present) {
+      Serial.println("EVENT: Adapter input restored");
+      appendEvent("adapter_restored");
+    } else {
+      Serial.println("EVENT: Adapter input lost");
+      appendEvent("adapter_lost");
+    }
+
+    // Persist only confirmed changes, not every ADC sample.
+    // Update the in-memory saved state only after a successful write.
+    if (savedAdapterState != adapterState && savePowerState(adapterState)) {
+      savedAdapterState = adapterState;
+      Serial.println("POWER STATE: Confirmed state saved");
+    }
   }
 }
 
@@ -211,6 +255,247 @@ void sampleSensors() {
     busV = ina226.getBusVoltage();
     currentMA = ina226.getCurrent_mA();
     powerMW = ina226.getPower_mW();
+  }
+}
+
+// =====================================================
+// TIME VALIDATION (NTP)
+// =====================================================
+
+bool isTimeValid() {
+  time_t now = time(nullptr);
+
+  // Reject timestamps before 2025-01-01 UTC.
+  return now >= 1735689600;
+}
+
+// =====================================================
+// EVENT LOG (LittleFS)
+// =====================================================
+
+// Keep the most recent MAX_EVENT_RECORDS entries.
+
+
+// Read last confirmed power-source state from LittleFS
+AdapterState loadPowerState() {
+  if (!littlefsMounted) {
+    return AdapterState::Unknown;
+  }
+
+  File file = LittleFS.open(POWER_STATE_FILE, "r");
+  if (!file) {
+    return AdapterState::Unknown;
+  }
+
+  String state = file.readStringUntil('\n');
+  file.close();
+  state.trim();
+
+  if (state == "adapter") {
+    return AdapterState::Present;
+  }
+
+  if (state == "battery") {
+    return AdapterState::Absent;
+  }
+
+  return AdapterState::Unknown;
+}
+
+// Save last confirmed power-source state to LittleFS
+bool savePowerState(AdapterState state) {
+  if (!littlefsMounted || state == AdapterState::Unknown) {
+    return false;
+  }
+
+  File file = LittleFS.open(POWER_STATE_FILE, "w");
+  if (!file) {
+    Serial.println("POWER STATE: Failed to open file");
+    return false;
+  }
+
+  const char* value =
+      state == AdapterState::Present ? "adapter\n" : "battery\n";
+
+  size_t written = file.print(value);
+  file.close();
+
+  if (written != strlen(value)) {
+    Serial.println("POWER STATE: Write failed");
+    return false;
+  }
+
+  return true;
+}
+
+
+bool trimEventLog() {
+  if (!littlefsMounted || !LittleFS.exists("/events.csv")) {
+    return false;
+  }
+
+  File source = LittleFS.open("/events.csv", "r");
+  if (!source) return false;
+
+  size_t lines = 0;
+  while (source.available()) {
+    if (source.read() == '\n') ++lines;
+  }
+
+  if (lines <= MAX_EVENT_RECORDS) {
+    source.close();
+    return true;
+  }
+
+  const size_t skipLines = lines - MAX_EVENT_RECORDS;
+
+if (!source.seek(0)) {
+  Serial.println("EVENT LOG: Failed to rewind source");
+  source.close();
+  return false;
+}
+
+if (LittleFS.exists("/events.tmp")) {
+  if (!LittleFS.remove("/events.tmp")) {
+    Serial.println("EVENT LOG: Failed to remove old temp file");
+    source.close();
+    return false;
+  }
+}
+
+  File temp = LittleFS.open("/events.tmp", "w");
+  if (!temp) {
+    source.close();
+    return false;
+  }
+
+  size_t currentLine = 0;
+  bool copyOK = true;
+
+  while (source.available()) {
+    String line = source.readStringUntil('\n');
+
+    if (currentLine++ < skipLines) continue;
+
+    if (temp.print(line + "\n") != line.length() + 1) {
+  copyOK = false;
+  break;
+}
+  }
+
+    if (copyOK) {
+    temp.flush();
+    if (temp.getWriteError()) {
+      Serial.println("EVENT LOG: Flush failed");
+      copyOK = false;
+    }
+  }
+
+  temp.close();
+  source.close();
+
+  if (!copyOK) {
+    LittleFS.remove("/events.tmp");
+    return false;
+  }
+
+  // Keep the original file until the temporary copy is ready.
+  if (!LittleFS.rename("/events.tmp", "/events.csv")) {
+    Serial.println("EVENT LOG: Trim rename failed");
+    return false;
+  }
+
+  return true;
+}
+
+bool appendEvent(const char* eventType) {
+  if (!littlefsMounted || !eventType) {
+    return false;
+  }
+
+  File file = LittleFS.open("/events.csv", "a");
+
+  if (!file) {
+    Serial.println("EVENT LOG: Failed to open file");
+    return false;
+  }
+
+  time_t now = time(nullptr);
+
+  // Zero means that a reliable timestamp is unavailable.
+  if (!isTimeValid()) {
+    now = 0;
+  }
+
+  String record = String((uint32_t)now);
+  record += ",";
+  record += eventType;
+  if (now == 0 && !pendingEventTime) {
+    pendingEventId = esp_random();
+    if (!pendingEventId) pendingEventId = 1;
+    pendingEventMillis = millis();
+    pendingEventTime = true;
+    record += ",boot:";
+    record += String(pendingEventId);
+  }
+  record += "\n";
+
+  const size_t written = file.print(record);
+  file.close();
+
+  if (written != record.length()) {
+    Serial.println("EVENT LOG: Write failed");
+    pendingEventTime = false;
+    return false;
+  }
+
+  Serial.print("EVENT LOG: ");
+Serial.print(record);
+
+if (!trimEventLog()) {
+  Serial.println("EVENT LOG: Trim failed");
+  return false;
+}
+
+return true;
+}
+
+// After NTP sync, resolve only the pending event created in THIS boot.
+// The calculated time is approximate (the power loss precedes reboot).
+void resolvePendingEventTime() {
+  if (!pendingEventTime || !isTimeValid() || !littlefsMounted) return;
+  File src = LittleFS.open("/events.csv", "r");
+  if (!src) return;
+  LittleFS.remove("/events_time.tmp");
+  File dst = LittleFS.open("/events_time.tmp", "w");
+  if (!dst) { src.close(); return; }
+  const String marker = String(",boot:") + String(pendingEventId);
+  const uint32_t elapsed = (uint32_t)(millis() - pendingEventMillis) / 1000UL;
+  const uint32_t approxEpoch = (uint32_t)time(nullptr) - elapsed;
+  bool found = false;
+  bool ok = true;
+  while (src.available()) {
+    String row = src.readStringUntil('\n');
+    row.trim();
+    if (!row.length()) continue;
+    if (row.endsWith(marker)) {
+      int comma = row.indexOf(',');
+      if (comma > 0) {
+        row = String(approxEpoch) + row.substring(comma, row.length() - marker.length()) + ",approx";
+        found = true;
+      }
+    }
+    if (dst.println(row) != row.length() + 2) { ok = false; break; }
+  }
+  dst.flush();
+  if (dst.getWriteError()) ok = false;
+  dst.close();
+  src.close();
+  if (ok && found && LittleFS.rename("/events_time.tmp", "/events.csv")) {
+    pendingEventTime = false;
+    Serial.println("EVENT LOG: Approximate boot event timestamp resolved");
+  } else {
+    LittleFS.remove("/events_time.tmp");
   }
 }
 
@@ -290,6 +575,16 @@ void sendData() {
   json += ",\"littlefs_used\":";
   json += String(littlefsMounted ? LittleFS.usedBytes() : 0);
 
+// NTP diagnostics
+json += ",\"ntpSynced\":";
+json += (isTimeValid() ? "true" : "false");
+
+json += ",\"unixTime\":";
+json += String((uint32_t)time(nullptr));
+
+  json += ",\"otaReady\":";
+  json += (otaStarted ? "true" : "false");
+
   // Firmware information
   json += ",\"firmwareVersion\":\"";
   json += FIRMWARE_VERSION;
@@ -332,619 +627,91 @@ void sendData() {
 // =====================================================
 
 const char PAGE[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="uk">
-<head>
-<meta charset="utf-8">
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
-
-<title>ESP32-S3 UPS Monitor</title>
-
+<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3 UPS Monitor v3.8</title>
 <style>
-:root {
-  color-scheme: dark;
-  font-family: system-ui, Arial, sans-serif;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  background: #0b1220;
-  color: #e8f0ff;
-}
-
-header {
-  background: #14223b;
-  border-bottom: 1px solid #30425e;
-  padding: 21px;
-  text-align: center;
-}
-
-h1 {
-  font-size: 23px;
-  margin: 0;
-}
-
-header p {
-  color: #9bb3d6;
-  margin: 6px 0 0;
-}
-
-.wrap {
-  max-width: 1100px;
-  margin: auto;
-  padding: 18px;
-}
-
-.status {
-  text-align: center;
-  padding: 13px;
-  font-weight: 700;
-}
-
-.ok { color: #4ade80; }
-.warn { color: #fbbf24; }
-.danger { color: #fb7185; }
-
-.grid {
-  display: grid;
-  grid-template-columns:
-    repeat(auto-fit, minmax(190px, 1fr));
-  gap: 12px;
-}
-
-.card {
-  background: #182940;
-  border: 1px solid #304765;
-  border-radius: 13px;
-  padding: 17px;
-}
-
-.label {
-  font-size: 13px;
-  color: #a6bfdf;
-}
-
-.value {
-  font-size: 26px;
-  font-weight: 750;
-  margin-top: 9px;
-}
-
-h2 {
-  font-size: 18px;
-  margin: 26px 0 12px;
-}
-
-.cellrow {
-  padding: 12px 0;
-  border-bottom: 1px solid #354962;
-}
-
-.cellrow:last-child {
-  border: 0;
-}
-
-.celltop {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.track {
-  height: 9px;
-  border-radius: 8px;
-  background: #33455d;
-  margin-top: 9px;
-  overflow: hidden;
-}
-
-.fill {
-  height: 100%;
-  background: #35c98c;
-  border-radius: 8px;
-}
-
-.fill.warnfill {
-  background: #fbbf24;
-}
-
-.muted {
-  color: #9bb3d6;
-  font-size: 13px;
-}
-
-.charts {
-  display: grid;
-  grid-template-columns:
-    repeat(auto-fit, minmax(290px, 1fr));
-  gap: 12px;
-}
-
-.chart {
-  width: 100%;
-  height: 155px;
-  display: block;
-}
-
-.foot {
-  font-size: 12px;
-  color: #93a9c8;
-  margin: 22px 0;
-}
-</style>
-</head>
-
-<body>
-
-<header>
-  <h1>ESP32-S3 UPS Monitor</h1>
-  <p>Моніторинг резервного живлення · <span id="headerVersion">—</span></p>
-</header>
-
-<main class="wrap">
-
-<div id="status" class="status warn">
-  Очікування вимірювань...
-</div>
-
+:root{color-scheme:dark;font-family:system-ui,Arial,sans-serif}*{box-sizing:border-box}
+body{margin:0;background:#0b1220;color:#e8f0ff;font-size:14px}
+.wrap{max-width:1240px;margin:auto;padding:12px 16px 22px}
+header{text-align:center;padding:12px 10px 8px}h1{font-size:21px;margin:0}header p{margin:3px 0;color:#9bb3d6;font-size:12px}
+.tabs{display:flex;gap:5px;background:#14223b;border:1px solid #304765;border-radius:12px;padding:4px;margin:8px 0 12px}
+.tab{flex:1;background:transparent;border:0;border-radius:9px;color:#b8c9e0;padding:10px;cursor:pointer;font-size:14px;font-weight:650}
+.tab.active{background:#2c4768;color:#fff}.panel{display:none}.panel.active{display:block}
+.card{background:#182940;border:1px solid #304765;border-radius:11px;padding:12px;min-width:0}
+.label{font-size:12px;color:#a6bfdf}.value{font-size:21px;font-weight:750;margin-top:3px;overflow-wrap:anywhere}
+.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:9px}
+.source{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:9px}
+.source strong{font-size:19px}.source small{color:#a6bfdf;display:block;margin-top:3px}
+.ok{color:#4ade80}.warn{color:#fbbf24}.danger{color:#fb7185}.muted{color:#9bb3d6;font-size:12px}
+h2{font-size:15px;margin:13px 0 7px}.cellgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.cellitem{background:#182940;border:1px solid #304765;border-radius:9px;padding:9px;min-width:0}
+.cellitem strong{display:block;font-size:16px;margin-top:3px}.track{height:5px;background:#33455d;border-radius:8px;margin-top:7px;overflow:hidden}
+.fill{height:100%;background:#35c98c}.fill.warnfill{background:#fbbf24}
+.charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.chart{display:block;width:100%;height:132px}
+.foot{font-size:11px;color:#93a9c8;margin:10px 0}.notice{padding:8px 11px;margin-bottom:9px;font-size:12px}
+.tablewrap{max-height:65vh;overflow:auto;border:1px solid #304765;border-radius:10px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #304765}th{color:#a6bfdf;background:#14223b;position:sticky;top:0}td:first-child{white-space:nowrap}
+.systemgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.cellgrid{grid-template-columns:repeat(3,minmax(0,1fr))}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.wrap{padding:8px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}.chart{height:105px}.source strong{font-size:16px}.cellitem strong{font-size:14px}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.8</span></p></header>
+<nav class="tabs" aria-label="Вкладки"><button class="tab active" data-tab="main">Головна</button><button class="tab" data-tab="events">Журнал</button><button class="tab" data-tab="system">Система</button></nav>
+<section id="panel-main" class="panel active">
+<div class="card source"><div><div class="label">Поточне джерело живлення (за входом адаптера)</div><strong id="powerSource">Визначення...</strong><small id="lastSwitch">Останнє перемикання: —</small></div><div id="adapterVoltage" class="muted">DC+: —</div></div>
+<div id="status" class="card notice muted">Очікування вимірювань...</div>
 <div class="grid">
-
-  <div class="card">
-    <div class="label">Джерело живлення</div>
-    <div id="powerSource" class="value">Визначення...</div>
-    <div id="adapterVoltage" class="muted">Вхід DC+: —</div>
-    <div class="muted">За наявністю напруги адаптера, не за положенням реле YX850.</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Напруга акумулятора</div>
-    <div id="battery" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Струм навантаження</div>
-    <div id="current" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Потужність</div>
-    <div id="power" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Кількість комірок</div>
-    <div id="count" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Орієнтовний заряд</div>
-    <div id="soc" class="value">—</div>
-    <div class="muted">
-      Оцінка за напругою, не точний SoC
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="label">Шина INA226</div>
-    <div id="bus" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Розбаланс комірок</div>
-    <div id="imbalance" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Wi-Fi сигнал</div>
-    <div id="wifi" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Час роботи ESP32</div>
-    <div id="uptime" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Причина перезапуску</div>
-    <div id="resetReason" class="value">—</div>
-  </div>
-
-    <div class="card">
-    <div class="label">Вільна RAM</div>
-    <div id="freeHeap" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Версія прошивки</div>
-    <div id="firmwareVersion" class="value">—</div>
-  </div>
-
-  <div class="card">
-    <div class="label">Дата компіляції</div>
-    <div id="buildDateTime" class="value">—</div>
-  </div>
-
+<div class="card"><div class="label">Акумулятор</div><div class="value" id="battery">—</div></div>
+<div class="card"><div class="label">Напруга шини</div><div class="value" id="bus">—</div></div>
+<div class="card"><div class="label">Струм</div><div class="value" id="current">—</div></div>
+<div class="card"><div class="label">Потужність</div><div class="value" id="power">—</div></div>
+<div class="card"><div class="label">Заряд (оцінка)</div><div class="value" id="soc">—</div></div>
+<div class="card"><div class="label">Розбаланс</div><div class="value" id="imbalance">—</div></div>
 </div>
-
-
-<h2>Попередження</h2>
-<div id="alerts" class="card muted">
-  Очікування даних...
-</div>
-
-<h2>Напруга комірок</h2>
-<div id="cells" class="card">—</div>
-
-<h2>Балансувальні канали B1–B6</h2>
-<div id="taps" class="card">—</div>
-
-<h2>Графіки (останні 60 вимірювань)</h2>
-
-<div class="charts">
-
-  <div class="card">
-    <div class="label">Напруга шини, В</div>
-    <canvas class="chart" id="chartV"></canvas>
-  </div>
-
-  <div class="card">
-    <div class="label">Струм, мА</div>
-    <canvas class="chart" id="chartI"></canvas>
-  </div>
-
-  <div class="card">
-    <div class="label">Потужність, Вт</div>
-    <canvas class="chart" id="chartP"></canvas>
-  </div>
-
-</div>
-
-<p class="foot">
-  Графіки зберігаються лише в браузері.
-  Без BMS і апаратного захисту вебмоніторинг
-  не запобігає перерозряду акумулятора.
-</p>
-
-</main>
-
-<script>
-const $ = id => document.getElementById(id);
-
-const history = {
-  v: [],
-  i: [],
-  p: []
-};
-
-function line(canvas, values) {
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-
-  canvas.width = Math.round(w * dpr);
-  canvas.height = Math.round(h * dpr);
-
-  const c = canvas.getContext('2d');
-
-  c.scale(dpr, dpr);
-  c.clearRect(0, 0, w, h);
-
-  c.strokeStyle = '#38516f';
-  c.lineWidth = 1;
-
-  for (let j = 1; j < 4; j++) {
-    let y = h * j / 4;
-    c.beginPath();
-    c.moveTo(8, y);
-    c.lineTo(w - 8, y);
-    c.stroke();
-  }
-
-  if (!values.length) return;
-
-  let lo = Math.min(...values);
-  let hi = Math.max(...values);
-
-  if (hi - lo < 0.1) {
-    lo -= 0.05;
-    hi += 0.05;
-  }
-
-  c.strokeStyle = '#55b5ff';
-  c.lineWidth = 2;
-  c.beginPath();
-
-  values.forEach((v, j) => {
-    let x = 9 + j * (w - 18) /
-      Math.max(1, values.length - 1);
-
-    let y = h - 10 -
-      (v - lo) / (hi - lo) * (h - 20);
-
-    if (!j) c.moveTo(x, y);
-    else c.lineTo(x, y);
-  });
-
-  c.stroke();
-
-  c.fillStyle = '#aec4df';
-  c.font = '12px system-ui';
-
-  c.fillText(hi.toFixed(2), 10, 13);
-  c.fillText(lo.toFixed(2), 10, h - 3);
-}
-
-function add(k, v) {
-  if (!Number.isFinite(v)) return;
-
-  history[k].push(v);
-
-  if (history[k].length > 60) {
-    history[k].shift();
-  }
-}
-
-function approxSOC(v) {
-  const points = [
-    [3.0, 0],
-    [3.3, 5],
-    [3.5, 10],
-    [3.6, 20],
-    [3.7, 35],
-    [3.8, 50],
-    [3.9, 65],
-    [4.0, 80],
-    [4.1, 92],
-    [4.2, 100]
-  ];
-
-  if (v <= 3) return 0;
-  if (v >= 4.2) return 100;
-
-  for (let j = 1; j < points.length; j++) {
-    if (v <= points[j][0]) {
-      let a = points[j - 1];
-      let b = points[j];
-
-      return Math.round(
-        a[1] +
-        (v - a[0]) *
-        (b[1] - a[1]) /
-        (b[0] - a[0])
-      );
-    }
-  }
-
-  return 100;
-}
-
-async function update() {
-  try {
-    const r = await fetch('/api/data', {
-      cache: 'no-store'
-    });
-
-    if (!r.ok) {
-      throw Error('HTTP ' + r.status);
-    }
-
-    const d = await r.json();
-
-    const sourceLabel = d.powerSource === 'adapter'
-      ? 'Адаптер 12 В'
-      : d.powerSource === 'battery'
-        ? 'Акумулятор'
-        : 'Визначення...';
-    $('powerSource').textContent = sourceLabel;
-    $('adapterVoltage').textContent =
-      typeof d.adapterInputVoltage === 'number'
-        ? 'Вхід DC+: ≈ ' + d.adapterInputVoltage.toFixed(2) + ' В'
-        : 'Вхід DC+: —';
-
-    $('status').textContent =
-      d.batteryValid
-        ? 'Батарея: попередньо визначена'
-        : 'Конфігурацію батареї не підтверджено';
-
-    $('status').className =
-      'status ' + (d.batteryValid ? 'ok' : 'warn');
-
-    $('battery').textContent =
-      d.batteryValid
-        ? d.batteryVoltage.toFixed(2) + ' В'
-        : '—';
-
-    $('current').textContent =
-      d.inaReady
-        ? d.currentMA.toFixed(1) + ' мА'
-        : '—';
-
-    $('power').textContent =
-      d.inaReady
-        ? (d.powerMW / 1000).toFixed(2) + ' Вт'
-        : '—';
-
-    $('bus').textContent =
-      d.inaReady
-        ? d.busVoltage.toFixed(2) + ' В'
-        : '—';
-
-    $('count').textContent =
-      d.batteryValid
-        ? d.detectedCells + 'S'
-        : 'Невідомо';
-
-    $('soc').textContent =
-      d.batteryValid
-        ? approxSOC(
-            d.batteryVoltage / d.detectedCells
-          ) + ' %'
-        : '—';
-
-    $('wifi').textContent =
-      d.wifiConnected
-        ? d.wifiRSSI + ' dBm'
-        : '—';
-
-    const hours = Math.floor(
-      d.uptimeSeconds / 3600
-    );
-
-    const minutes = Math.floor(
-      (d.uptimeSeconds % 3600) / 60
-    );
-
-     $('uptime').textContent =
-      hours + ' год ' + minutes + ' хв';
-
-    $('resetReason').textContent =
-      d.resetReason || '—';
-
-          // Free heap memory
-    $('freeHeap').textContent =
-      typeof d.freeHeap === 'number'
-        ? (d.freeHeap / 1024).toFixed(1) + ' КБ'
-        : '—';
-
-    // Firmware version
-    $('firmwareVersion').textContent =
-      d.firmwareVersion || '—';
-
-    $('headerVersion').textContent =
-      d.firmwareVersion || '—';
-
-    // Build date and time
-    $('buildDateTime').textContent =
-      d.buildDate && d.buildTime
-        ? d.buildDate + ' ' + d.buildTime
-        : '—';
-
-    const cellBox = $('cells');
-    cellBox.replaceChildren();
-
-    const alertBox = $('alerts');
-    alertBox.replaceChildren();
-
-    if (d.batteryValid) {
-      const vs = d.cells.slice(0, d.detectedCells);
-
-      const imbalance =
-        Math.max(...vs) - Math.min(...vs);
-
-      $('imbalance').textContent =
-        (imbalance * 1000).toFixed(0) + ' мВ';
-
-      vs.forEach((v, i) => {
-        const row = document.createElement('div');
-        row.className = 'cellrow';
-
-        const top = document.createElement('div');
-        top.className = 'celltop';
-
-        const name = document.createElement('span');
-        name.textContent = 'Комірка ' + (i + 1);
-
-        const value = document.createElement('strong');
-        value.textContent = v.toFixed(3) + ' В';
-
-        top.append(name, value);
-        row.appendChild(top);
-
-        const track = document.createElement('div');
-        track.className = 'track';
-
-        const fill = document.createElement('div');
-        fill.className =
-          'fill' +
-          (v < 3.3 || v > 4.2 ? ' warnfill' : '');
-
-        fill.style.width =
-          Math.max(0, Math.min(100, v / 4.2 * 100)) + '%';
-
-        track.appendChild(fill);
-        row.appendChild(track);
-        cellBox.appendChild(row);
-      });
-
-      const warnings = [];
-
-      if (vs.some(v => v < 3.3)) {
-        warnings.push(
-          'Низька напруга однієї або кількох комірок.'
-        );
-      }
-
-      if (vs.some(v => v > 4.2)) {
-        warnings.push(
-          'Напруга комірки перевищує 4,20 В.'
-        );
-      }
-
-      if (imbalance > 0.10) {
-        warnings.push(
-          'Різниця між комірками понад 100 мВ.'
-        );
-      }
-
-      alertBox.textContent =
-        warnings.length
-          ? warnings.join(' ')
-          : 'Критичних відхилень за заданими порогами не виявлено.';
-
-    } else {
-      $('imbalance').textContent = '—';
-
-      cellBox.textContent =
-        'Немає підтверджених даних про комірки.';
-
-      alertBox.textContent =
-        'Перевір балансувальні канали.';
-    }
-
-    const tapBox = $('taps');
-    tapBox.replaceChildren();
-
-    d.taps.forEach((v, i) => {
-      const row = document.createElement('div');
-      row.className = 'cellrow';
-
-      row.textContent =
-        'B' + (i + 1) +
-        ': ' + v.toFixed(3) + ' В';
-
-      tapBox.appendChild(row);
-    });
-
-    if (d.inaReady) {
-      add('v', d.busVoltage);
-      add('i', d.currentMA);
-      add('p', d.powerMW / 1000);
-
-      line($('chartV'), history.v);
-      line($('chartI'), history.i);
-      line($('chartP'), history.p);
-    }
-
-  } catch (e) {
-    $('status').textContent =
-      'Втрачено зв’язок з ESP32';
-
-    $('status').className = 'status danger';
-
-    console.error(e);
-  }
-}
-
-update();
-setInterval(update, 3000);
-</script>
-</body>
-</html>
+<h2>Напруга комірок <span id="count" class="muted"></span></h2><div class="cellgrid" id="cells"></div>
+<h2>Балансувальні канали B1–B6</h2><div class="cellgrid" id="taps"></div>
+<h2>Графіки (останні 60 вимірювань)</h2><div class="charts">
+<div class="card"><div class="label">Напруга шини, В</div><canvas class="chart" id="chartV"></canvas></div>
+<div class="card"><div class="label">Струм, мА</div><canvas class="chart" id="chartI"></canvas></div>
+<div class="card"><div class="label">Потужність, Вт</div><canvas class="chart" id="chartP"></canvas></div></div>
+<p class="foot">Графіки зберігаються лише в браузері. Без BMS вебмоніторинг не запобігає перерозряду. Джерело визначається за напругою DC+, а не положенням реле YX850.</p>
+</section>
+<section id="panel-events" class="panel"><h2>Журнал подій живлення</h2><p class="muted">≈ — приблизний час відключення, визначений після запуску ESP32 та синхронізації NTP.</p><div class="tablewrap"><table><thead><tr><th>Дата та час</th><th>Подія</th></tr></thead><tbody id="events"><tr><td colspan="2">Завантаження...</td></tr></tbody></table></div></section>
+<section id="panel-system" class="panel"><h2>Діагностика системи</h2><div class="systemgrid">
+<div class="card"><div class="label">Версія прошивки</div><div class="value" id="firmwareVersion">—</div></div>
+<div class="card"><div class="label">INA226</div><div class="value" id="inaState">—</div></div>
+<div class="card"><div class="label">Wi-Fi / RSSI</div><div class="value" id="wifi">—</div></div>
+<div class="card"><div class="label">Час роботи</div><div class="value" id="uptime">—</div></div>
+<div class="card"><div class="label">Причина перезапуску</div><div class="value" id="resetReason">—</div></div>
+<div class="card"><div class="label">Вільна RAM</div><div class="value" id="freeHeap">—</div></div>
+<div class="card"><div class="label">LittleFS</div><div class="value" id="littlefs">—</div></div>
+<div class="card"><div class="label">NTP</div><div class="value" id="ntp">—</div></div>
+<div class="card"><div class="label">OTA</div><div class="value" id="ota">—</div></div>
+<div class="card"><div class="label">Дата компіляції</div><div class="value" id="buildDateTime" style="font-size:15px">—</div></div>
+</div><h2>Попередження</h2><div id="alerts" class="card muted">Очікування даних...</div></section>
+</div><script>
+const $=id=>document.getElementById(id);
+let activeTab='main';let latestData=null;let events=[];
+const history={v:[],i:[],p:[]};
+function setTab(tab){activeTab=tab;document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));if(tab==='main')drawCharts();if(tab==='events')updateEvents();}
+document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.tab)));
+function add(k,v){if(!Number.isFinite(v))return;history[k].push(v);if(history[k].length>60)history[k].shift();}
+function line(canvas,values){if(!canvas.clientWidth||!canvas.clientHeight)return;const dpr=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);c.strokeStyle='#38516f';c.lineWidth=1;for(let j=1;j<4;j++){let y=h*j/4;c.beginPath();c.moveTo(8,y);c.lineTo(w-8,y);c.stroke();}if(!values.length)return;let lo=Math.min(...values),hi=Math.max(...values);if(hi-lo<0.1){lo-=0.05;hi+=0.05;}c.strokeStyle='#55b5ff';c.lineWidth=2;c.beginPath();values.forEach((v,j)=>{const x=9+j*(w-18)/Math.max(1,values.length-1),y=h-10-(v-lo)/(hi-lo)*(h-20);if(!j)c.moveTo(x,y);else c.lineTo(x,y);});c.stroke();c.fillStyle='#aec4df';c.font='12px system-ui';c.fillText(hi.toFixed(2),10,13);c.fillText(lo.toFixed(2),10,h-3);}
+function drawCharts(){line($('chartV'),history.v);line($('chartI'),history.i);line($('chartP'),history.p);}
+window.addEventListener('resize',()=>{if(activeTab==='main')drawCharts();});
+function approxSOC(v){const p=[[3,0],[3.3,5],[3.5,10],[3.6,20],[3.7,35],[3.8,50],[3.9,65],[4,80],[4.1,92],[4.2,100]];if(v<=3)return 0;if(v>=4.2)return 100;for(let j=1;j<p.length;j++)if(v<=p[j][0]){let a=p[j-1],b=p[j];return Math.round(a[1]+(v-a[0])*(b[1]-a[1])/(b[0]-a[0]));}return 100;}
+function formatDate(sec){if(!(sec>0))return null;return new Date(sec*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});}
+function eventLabel(type){return type==='adapter_lost'?'Адаптер відключено — акумулятор':type==='adapter_restored'?'Адаптер підключено — мережа':type;}
+function renderLastSwitch(){const last=events[0];$('lastSwitch').textContent=last&&last.time>0?'Останнє перемикання: '+(last.approx?'≈ ':'')+formatDate(last.time):'Останнє перемикання: —';}
+async function updateEvents(){try{const r=await fetch('/api/events',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const csv=await r.text();events=csv.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>{const [time,type,flag]=x.split(',');return {time:Number(time),type,approx:flag==='approx'};}).reverse();renderLastSwitch();if(activeTab!=='events')return;const box=$('events');box.replaceChildren();if(!events.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=2;td.textContent='Подій поки немає.';tr.appendChild(td);box.appendChild(tr);return;}events.forEach(e=>{const tr=document.createElement('tr'),td1=document.createElement('td'),td2=document.createElement('td');td1.textContent=e.time>0?(e.approx?'≈ ':'')+formatDate(e.time):'Немає збереженого часу';td2.textContent=eventLabel(e.type);td2.className=e.type==='adapter_lost'?'warn':e.type==='adapter_restored'?'ok':'';tr.append(td1,td2);box.appendChild(tr);});}catch(e){console.error(e);if(activeTab==='events')$('events').textContent='Не вдалося завантажити журнал.';}}
+function tile(label,value,warning){const el=document.createElement('div');el.className='cellitem';const a=document.createElement('div');a.className='label';a.textContent=label;const b=document.createElement('strong');b.textContent=value;if(warning)b.className='warn';el.append(a,b);return el;}
+async function update(){try{const r=await fetch('/api/data',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();latestData=d;$('powerSource').textContent=d.powerSource==='adapter'?'Адаптер 12 В':d.powerSource==='battery'?'Акумулятор':'Визначення...';$('powerSource').className=d.powerSource==='adapter'?'ok':d.powerSource==='battery'?'warn':'';$('adapterVoltage').textContent='Вхід DC+: '+(typeof d.adapterInputVoltage==='number'?'≈ '+d.adapterInputVoltage.toFixed(2)+' В':'—');$('status').textContent=d.batteryValid?'Батарея: конфігурацію визначено':'Конфігурацію батареї не підтверджено';$('status').className='card notice '+(d.batteryValid?'ok':'warn');$('battery').textContent=d.batteryValid?d.batteryVoltage.toFixed(2)+' В':'—';$('bus').textContent=d.inaReady?d.busVoltage.toFixed(2)+' В':'—';$('current').textContent=d.inaReady?d.currentMA.toFixed(1)+' мА':'—';$('power').textContent=d.inaReady?(d.powerMW/1000).toFixed(2)+' Вт':'—';$('soc').textContent=d.batteryValid?approxSOC(d.batteryVoltage/d.detectedCells)+' %':'—';$('count').textContent=d.batteryValid?'· '+d.detectedCells+'S':'';
+const cellBox=$('cells');cellBox.replaceChildren();const vs=d.batteryValid?d.cells.slice(0,d.detectedCells):[];const imbalance=vs.length?Math.max(...vs)-Math.min(...vs):0;$('imbalance').textContent=vs.length?(imbalance*1000).toFixed(0)+' мВ':'—';if(vs.length){vs.forEach((v,i)=>{const el=tile('Комірка '+(i+1),v.toFixed(3)+' В',v<3.3||v>4.2);const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill'+(v<3.3||v>4.2?' warnfill':'');fill.style.width=Math.max(0,Math.min(100,v/4.2*100))+'%';track.appendChild(fill);el.appendChild(track);cellBox.appendChild(el);});}else cellBox.textContent='Немає підтверджених даних про комірки.';
+const tapBox=$('taps');tapBox.replaceChildren();d.taps.forEach((v,i)=>tapBox.appendChild(tile('B'+(i+1),v.toFixed(3)+' В')));
+const warnings=[];if(vs.some(v=>v<3.3))warnings.push('Низька напруга однієї або кількох комірок.');if(vs.some(v=>v>4.2))warnings.push('Напруга комірки перевищує 4,20 В.');if(imbalance>0.10)warnings.push('Різниця між комірками понад 100 мВ.');$('alerts').textContent=!d.batteryValid?'Перевір балансувальні канали.':warnings.length?warnings.join(' '):'Критичних відхилень за заданими порогами не виявлено.';
+$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.8';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
+}catch(e){$('status').textContent='Втрачено зв’язок з ESP32';$('status').className='card notice danger';console.error(e);}}
+update();updateEvents();setInterval(update,3000);setInterval(updateEvents,10000);
+</script></body></html>
 )HTML";
 
 // =====================================================
@@ -1047,15 +814,35 @@ void setup() {
     // LittleFS: mount existing filesystem without formatting
   littlefsMounted = LittleFS.begin(false, "/littlefs", 10, "spiffs");
 
+  
 if (littlefsMounted) {
-    Serial.println("LittleFS mounted successfully");
-    Serial.printf("LittleFS total: %u bytes\n",
-                  (unsigned)LittleFS.totalBytes());
-    Serial.printf("LittleFS used: %u bytes\n",
-                  (unsigned)LittleFS.usedBytes());
-  } else {
-    Serial.println("LittleFS mount failed - formatting disabled");
-  }
+  Serial.println("LittleFS mounted successfully");
+  Serial.printf("LittleFS total: %u bytes\n",
+                (unsigned)LittleFS.totalBytes());
+  Serial.printf("LittleFS used: %u bytes\n",
+                (unsigned)LittleFS.usedBytes());
+} else {
+  Serial.println("LittleFS mount failed - formatting disabled");
+}
+
+// Restore last confirmed power-source state
+savedAdapterState = loadPowerState();
+
+Serial.print("POWER STATE: Previous state = ");
+
+switch (savedAdapterState) {
+  case AdapterState::Present:
+    Serial.println("adapter");
+    break;
+
+  case AdapterState::Absent:
+    Serial.println("battery");
+    break;
+
+  default:
+    Serial.println("unknown");
+    break;
+}
 
   Serial.println();
   Serial.println("==============================");
@@ -1111,6 +898,15 @@ if (littlefsMounted) {
 
   Serial.println("Wi-Fi connection started");
 
+// NTP time synchronization (Ukraine)
+configTzTime(
+  "EET-2EEST,M3.5.0/3,M10.5.0/4",
+  "pool.ntp.org",
+  "time.google.com"
+);
+
+Serial.println("NTP synchronization configured");
+
   // OTA
   ArduinoOTA.setHostname("esp32-ups");
   ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1138,6 +934,25 @@ if (littlefsMounted) {
 
   server.on("/api/data", HTTP_GET, sendData);
 
+  server.on("/api/events", HTTP_GET, []() {
+  if (!littlefsMounted) {
+    server.send(503, "text/plain; charset=utf-8",
+                "LittleFS unavailable");
+    return;
+  }
+
+  File file = LittleFS.open("/events.csv", "r");
+
+  if (!file) {
+    server.send(200, "text/plain; charset=utf-8", "");
+    return;
+  }
+
+  server.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
+});
+
+  
   server.begin();
 
   Serial.println("Web server started");
@@ -1156,6 +971,7 @@ void loop() {
   }
 
   server.handleClient();
+  resolvePendingEventTime();
 
   if (millis() - lastSample >= SAMPLE_INTERVAL_MS) {
     lastSample = millis();
