@@ -1,6 +1,6 @@
 # Contributing / Внесок у проєкт
 
-ESP32-S3 Smart UPS Monitor — експериментальний технічний проєкт. Перш ніж пропонувати зміни, прочитайте [README](README.md) та [SAFETY](docs/SAFETY.md).
+ESP32-S3 Smart UPS Monitor — експериментальний технічний проєкт. Перш ніж пропонувати зміни, прочитайте [README](README.md), [SAFETY](docs/SAFETY.md) та [правила спільноти](CODE_OF_CONDUCT.md).
 
 - Нові функції розробляйте в окремих гілках `feature/...`; документацію — у `docs/...`.
 - Для Pull Request опишіть мету, змінені файли, реальні випробування, відомі обмеження та результат `pio run -e esp32s3`.
