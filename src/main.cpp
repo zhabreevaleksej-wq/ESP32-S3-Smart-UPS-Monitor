@@ -17,7 +17,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.8";
+static const char* const FIRMWARE_VERSION = "v3.9-dev1";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -61,6 +61,19 @@ constexpr size_t MAX_EVENT_RECORDS = 200;
 // Persistent power-source state
 constexpr const char* POWER_STATE_FILE = "/power_state.txt";
 
+// Experimental v3.9: 5-minute measurement history.
+// Keep at most 7 days of 5-minute records; compact down to 6 days
+// only after the limit has been exceeded (avoid rewriting the file
+// on every five-minute append).
+constexpr uint32_t MEASUREMENT_LOG_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr size_t MAX_MEASUREMENT_RECORDS = 7UL * 24UL * 12UL; // 2016
+constexpr size_t COMPACT_KEEP_RECORDS = 6UL * 24UL * 12UL;   // 1728
+constexpr const char* MEASUREMENT_LOG_FILE = "/measurements.csv";
+constexpr const char* MEASUREMENT_TEMP_FILE = "/measurements.tmp";
+constexpr const char* MEASUREMENT_CSV_HEADER =
+    "timestamp,source,cells,battery_v,bus_v,current_ma,power_w,"
+    "cell1_v,cell2_v,cell3_v,cell4_v,cell5_v,cell6_v\n";
+
 // Objects
 WebServer server(80);
 INA226 ina226(0x40);
@@ -80,8 +93,23 @@ float busV = 0.0f;
 float currentMA = 0.0f;
 float powerMW = 0.0f;
 
+
+
 // Power-source indication is inferred from adapter voltage only.
 enum class AdapterState : uint8_t { Unknown, Present, Absent };
+
+// Measurement history accumulator (new feature; event log untouched).
+size_t measurementRecordCount = 0;
+uint32_t measurementWindowStart = 0;
+uint16_t measurementWindowSamples = 0;
+AdapterState measurementSource = AdapterState::Unknown;
+int measurementCellCount = 0;
+double measurementBatteryV = 0.0;
+double measurementBusV = 0.0;
+double measurementCurrentMA = 0.0;
+double measurementPowerMW = 0.0;
+double measurementCells[6] = {};
+
 
 AdapterState adapterState = AdapterState::Unknown;
 AdapterState pendingAdapterState = AdapterState::Unknown;
@@ -500,6 +528,193 @@ void resolvePendingEventTime() {
 }
 
 // =====================================================
+// MEASUREMENT HISTORY (LittleFS, experimental v3.9)
+// =====================================================
+
+void resetMeasurementWindow() {
+  measurementWindowStart = 0;
+  measurementWindowSamples = 0;
+  measurementSource = AdapterState::Unknown;
+  measurementCellCount = 0;
+  measurementBatteryV = 0;
+  measurementBusV = 0;
+  measurementCurrentMA = 0;
+  measurementPowerMW = 0;
+  for (double &value : measurementCells) value = 0;
+}
+
+// Count existing CSV rows once during boot, without loading the file in RAM.
+void initializeMeasurementLog() {
+  measurementRecordCount = 0;
+  if (!littlefsMounted || !LittleFS.exists(MEASUREMENT_LOG_FILE)) return;
+
+  File input = LittleFS.open(MEASUREMENT_LOG_FILE, "r");
+  if (!input) {
+    Serial.println("MEASUREMENTS: Cannot open existing log");
+    return;
+  }
+  while (input.available()) {
+    String line = input.readStringUntil('\n');
+    line.trim();
+    if (line.length() && !line.startsWith("timestamp,")) {
+      ++measurementRecordCount;
+    }
+  }
+  input.close();
+  Serial.printf("MEASUREMENTS: %u existing records\n",
+                (unsigned)measurementRecordCount);
+}
+
+// Compact only after more than 7 days of rows have accumulated.
+// Keep the original file until a complete temporary copy is ready.
+bool compactMeasurementLog() {
+  if (!littlefsMounted || measurementRecordCount <= MAX_MEASUREMENT_RECORDS) {
+    return true;
+  }
+  File src = LittleFS.open(MEASUREMENT_LOG_FILE, "r");
+  if (!src) return false;
+  if (LittleFS.exists(MEASUREMENT_TEMP_FILE) &&
+      !LittleFS.remove(MEASUREMENT_TEMP_FILE)) {
+    src.close();
+    return false;
+  }
+  File dst = LittleFS.open(MEASUREMENT_TEMP_FILE, "w");
+  if (!dst) {
+    src.close();
+    return false;
+  }
+
+  const size_t skip = measurementRecordCount - COMPACT_KEEP_RECORDS;
+  size_t encountered = 0;
+  bool ok = dst.print(MEASUREMENT_CSV_HEADER) == strlen(MEASUREMENT_CSV_HEADER);
+  while (ok && src.available()) {
+    String line = src.readStringUntil('\n');
+    line.trim();
+    if (!line.length() || line.startsWith("timestamp,")) continue;
+    if (encountered++ < skip) continue;
+    if (dst.print(line + "\n") != line.length() + 1) ok = false;
+  }
+  if (ok) {
+    dst.flush();
+    if (dst.getWriteError()) ok = false;
+  }
+  dst.close();
+  src.close();
+
+  if (!ok) {
+    LittleFS.remove(MEASUREMENT_TEMP_FILE);
+    Serial.println("MEASUREMENTS: Failed to compact, original preserved");
+    return false;
+  }
+  if (!LittleFS.rename(MEASUREMENT_TEMP_FILE, MEASUREMENT_LOG_FILE)) {
+    Serial.println("MEASUREMENTS: Failed to replace history file");
+    return false;
+  }
+  measurementRecordCount = COMPACT_KEEP_RECORDS;
+  Serial.println("MEASUREMENTS: Compacted to 6 days of data");
+  return true;
+}
+
+bool appendMeasurementWindow() {
+  if (!littlefsMounted || !measurementWindowSamples || !isTimeValid()) {
+    return false;
+  }
+  const double count = measurementWindowSamples;
+  String record;
+  record.reserve(176);
+  record += String((uint32_t)time(nullptr));
+  record += ',';
+  record += (measurementSource == AdapterState::Present) ? "adapter" : "battery";
+  record += ',';
+  record += String(measurementCellCount);
+  record += ',';
+  record += String(measurementBatteryV / count, 3);
+  record += ',';
+  record += String(measurementBusV / count, 3);
+  record += ',';
+  record += String(measurementCurrentMA / count, 2);
+  record += ',';
+  record += String(measurementPowerMW / (1000.0 * count), 3);
+  for (int i = 0; i < 6; ++i) {
+    record += ',';
+    record += i < measurementCellCount
+        ? String(measurementCells[i] / count, 3) : String("0.000");
+  }
+  record += '\n';
+
+  File file = LittleFS.open(MEASUREMENT_LOG_FILE, "a");
+  if (!file) {
+    Serial.println("MEASUREMENTS: Cannot open CSV for append");
+    return false;
+  }
+  bool ok = true;
+  if (file.size() == 0) {
+    ok = file.print(MEASUREMENT_CSV_HEADER) == strlen(MEASUREMENT_CSV_HEADER);
+  }
+  if (ok) ok = file.print(record) == record.length();
+  if (ok) {
+    file.flush();
+    ok = !file.getWriteError();
+  }
+  file.close();
+
+  if (!ok) {
+    Serial.println("MEASUREMENTS: Failed to write CSV row");
+    return false;
+  }
+  ++measurementRecordCount;
+  Serial.printf("MEASUREMENTS: CSV row stored (%u total)\n",
+                (unsigned)measurementRecordCount);
+  if (!compactMeasurementLog()) {
+    Serial.println("MEASUREMENTS: Compaction deferred");
+  }
+  return true;
+}
+
+// Called once after each 3-second sensor sample. Averages samples across
+// a 5-minute window, rather than writing continuously to flash.
+void accumulateMeasurement() {
+  const bool valid = inaOK && batteryValid && cellCount > 0 &&
+      adapterState != AdapterState::Unknown &&
+      isfinite(batteryV) && isfinite(busV) &&
+      isfinite(currentMA) && isfinite(powerMW);
+  if (!valid) {
+    resetMeasurementWindow();
+    return;
+  }
+  for (int i = 0; i < cellCount; ++i) {
+    if (!isfinite(cells[i])) {
+      resetMeasurementWindow();
+      return;
+    }
+  }
+  if (measurementWindowSamples &&
+      (measurementSource != adapterState || measurementCellCount != cellCount)) {
+    // Do not average together samples from different input-source states.
+    resetMeasurementWindow();
+  }
+  if (!measurementWindowSamples) {
+    measurementWindowStart = millis();
+    measurementSource = adapterState;
+    measurementCellCount = cellCount;
+  }
+  measurementBatteryV += batteryV;
+  measurementBusV += busV;
+  measurementCurrentMA += currentMA;
+  measurementPowerMW += powerMW;
+  for (int i = 0; i < cellCount; ++i) measurementCells[i] += cells[i];
+  ++measurementWindowSamples;
+
+  if ((uint32_t)(millis() - measurementWindowStart) >=
+      MEASUREMENT_LOG_INTERVAL_MS) {
+    if (!appendMeasurementWindow()) {
+      Serial.println("MEASUREMENTS: Window skipped (time/FS/write unavailable)");
+    }
+    resetMeasurementWindow();
+  }
+}
+
+// =====================================================
 // JSON API
 // =====================================================
 
@@ -575,6 +790,10 @@ void sendData() {
   json += ",\"littlefs_used\":";
   json += String(littlefsMounted ? LittleFS.usedBytes() : 0);
 
+  // Diagnostics for the experimental history logger.
+  json += ",\"measurementRecords\":";
+  json += String(measurementRecordCount);
+
 // NTP diagnostics
 json += ",\"ntpSynced\":";
 json += (isTimeValid() ? "true" : "false");
@@ -628,7 +847,7 @@ json += String((uint32_t)time(nullptr));
 
 const char PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3 UPS Monitor v3.8</title>
+<title>ESP32-S3 UPS Monitor v3.9-dev1</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,Arial,sans-serif}*{box-sizing:border-box}
 body{margin:0;background:#0b1220;color:#e8f0ff;font-size:14px}
@@ -654,7 +873,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 .systemgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.cellgrid{grid-template-columns:repeat(3,minmax(0,1fr))}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:600px){.wrap{padding:8px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}.chart{height:105px}.source strong{font-size:16px}.cellitem strong{font-size:14px}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.8</span></p></header>
+</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.9-dev1</span></p></header>
 <nav class="tabs" aria-label="Вкладки"><button class="tab active" data-tab="main">Головна</button><button class="tab" data-tab="events">Журнал</button><button class="tab" data-tab="system">Система</button></nav>
 <section id="panel-main" class="panel active">
 <div class="card source"><div><div class="label">Поточне джерело живлення (за входом адаптера)</div><strong id="powerSource">Визначення...</strong><small id="lastSwitch">Останнє перемикання: —</small></div><div id="adapterVoltage" class="muted">DC+: —</div></div>
@@ -684,10 +903,11 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 <div class="card"><div class="label">Причина перезапуску</div><div class="value" id="resetReason">—</div></div>
 <div class="card"><div class="label">Вільна RAM</div><div class="value" id="freeHeap">—</div></div>
 <div class="card"><div class="label">LittleFS</div><div class="value" id="littlefs">—</div></div>
+<div class="card"><div class="label">Історія вимірювань</div><div class="value" id="historyRecords">—</div></div>
 <div class="card"><div class="label">NTP</div><div class="value" id="ntp">—</div></div>
 <div class="card"><div class="label">OTA</div><div class="value" id="ota">—</div></div>
 <div class="card"><div class="label">Дата компіляції</div><div class="value" id="buildDateTime" style="font-size:15px">—</div></div>
-</div><h2>Попередження</h2><div id="alerts" class="card muted">Очікування даних...</div></section>
+</div><p class="foot"><a href="/api/measurements" style="color:#80c7ff">Завантажити історію вимірювань (CSV)</a></p><h2>Попередження</h2><div id="alerts" class="card muted">Очікування даних...</div></section>
 </div><script>
 const $=id=>document.getElementById(id);
 let activeTab='main';let latestData=null;let events=[];
@@ -708,7 +928,7 @@ async function update(){try{const r=await fetch('/api/data',{cache:'no-store'});
 const cellBox=$('cells');cellBox.replaceChildren();const vs=d.batteryValid?d.cells.slice(0,d.detectedCells):[];const imbalance=vs.length?Math.max(...vs)-Math.min(...vs):0;$('imbalance').textContent=vs.length?(imbalance*1000).toFixed(0)+' мВ':'—';if(vs.length){vs.forEach((v,i)=>{const el=tile('Комірка '+(i+1),v.toFixed(3)+' В',v<3.3||v>4.2);const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill'+(v<3.3||v>4.2?' warnfill':'');fill.style.width=Math.max(0,Math.min(100,v/4.2*100))+'%';track.appendChild(fill);el.appendChild(track);cellBox.appendChild(el);});}else cellBox.textContent='Немає підтверджених даних про комірки.';
 const tapBox=$('taps');tapBox.replaceChildren();d.taps.forEach((v,i)=>tapBox.appendChild(tile('B'+(i+1),v.toFixed(3)+' В')));
 const warnings=[];if(vs.some(v=>v<3.3))warnings.push('Низька напруга однієї або кількох комірок.');if(vs.some(v=>v>4.2))warnings.push('Напруга комірки перевищує 4,20 В.');if(imbalance>0.10)warnings.push('Різниця між комірками понад 100 мВ.');$('alerts').textContent=!d.batteryValid?'Перевір балансувальні канали.':warnings.length?warnings.join(' '):'Критичних відхилень за заданими порогами не виявлено.';
-$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.8';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
+$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.9-dev1';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('historyRecords').textContent=typeof d.measurementRecords==='number'?d.measurementRecords+' / 2016':'—';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
 }catch(e){$('status').textContent='Втрачено зв’язок з ESP32';$('status').className='card notice danger';console.error(e);}}
 update();updateEvents();setInterval(update,3000);setInterval(updateEvents,10000);
 </script></body></html>
@@ -825,6 +1045,9 @@ if (littlefsMounted) {
   Serial.println("LittleFS mount failed - formatting disabled");
 }
 
+// Count persistent measurement-history records at boot.
+initializeMeasurementLog();
+
 // Restore last confirmed power-source state
 savedAdapterState = loadPowerState();
 
@@ -934,6 +1157,23 @@ Serial.println("NTP synchronization configured");
 
   server.on("/api/data", HTTP_GET, sendData);
 
+  // Download experiment's stored 5-minute measurements as CSV.
+  server.on("/api/measurements", HTTP_GET, []() {
+    if (!littlefsMounted) {
+      server.send(503, "text/plain; charset=utf-8", "LittleFS unavailable");
+      return;
+    }
+    File file = LittleFS.open(MEASUREMENT_LOG_FILE, "r");
+    if (!file) {
+      server.send(200, "text/csv; charset=utf-8", MEASUREMENT_CSV_HEADER);
+      return;
+    }
+    server.sendHeader("Content-Disposition",
+                      "attachment; filename=\"measurements.csv\"");
+    server.streamFile(file, "text/csv; charset=utf-8");
+    file.close();
+  });
+
   server.on("/api/events", HTTP_GET, []() {
   if (!littlefsMounted) {
     server.send(503, "text/plain; charset=utf-8",
@@ -976,6 +1216,7 @@ void loop() {
   if (millis() - lastSample >= SAMPLE_INTERVAL_MS) {
     lastSample = millis();
     sampleSensors();
+    accumulateMeasurement();
   }
 
   delay(5);
