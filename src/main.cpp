@@ -17,7 +17,7 @@
 // System Diagnostics
 // =====================================================
 
-static const char* const FIRMWARE_VERSION = "v3.9-dev1";
+static const char* const FIRMWARE_VERSION = "v3.9-dev2";
 static const char* const BUILD_DATE = __DATE__;
 static const char* const BUILD_TIME = __TIME__;
 
@@ -847,7 +847,7 @@ json += String((uint32_t)time(nullptr));
 
 const char PAGE[] PROGMEM = R"HTML(
 <!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3 UPS Monitor v3.9-dev1</title>
+<title>ESP32-S3 UPS Monitor v3.9-dev2</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,Arial,sans-serif}*{box-sizing:border-box}
 body{margin:0;background:#0b1220;color:#e8f0ff;font-size:14px}
@@ -870,11 +870,11 @@ h2{font-size:15px;margin:13px 0 7px}.cellgrid{display:grid;grid-template-columns
 .foot{font-size:11px;color:#93a9c8;margin:10px 0}.notice{padding:8px 11px;margin-bottom:9px;font-size:12px}
 .tablewrap{max-height:65vh;overflow:auto;border:1px solid #304765;border-radius:10px}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #304765}th{color:#a6bfdf;background:#14223b;position:sticky;top:0}td:first-child{white-space:nowrap}
-.systemgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
+.historycontrols{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:10px 0}.historycontrols button{background:#203957;color:#e8f0ff;border:1px solid #486587;border-radius:8px;padding:8px 12px;cursor:pointer}.historycontrols button.selected{background:#34577d;border-color:#80c7ff}.historychart{height:205px;width:100%;display:block}.historycharts{display:grid;grid-template-columns:1fr;gap:10px}.systemgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.cellgrid{grid-template-columns:repeat(3,minmax(0,1fr))}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:600px){.wrap{padding:8px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}.chart{height:105px}.source strong{font-size:16px}.cellitem strong{font-size:14px}.systemgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.9-dev1</span></p></header>
-<nav class="tabs" aria-label="Вкладки"><button class="tab active" data-tab="main">Головна</button><button class="tab" data-tab="events">Журнал</button><button class="tab" data-tab="system">Система</button></nav>
+</style></head><body><div class="wrap"><header><h1>ESP32-S3 UPS Monitor</h1><p>Моніторинг резервного живлення · <span id="headerVersion">v3.9-dev2</span></p></header>
+<nav class="tabs" aria-label="Вкладки"><button class="tab active" data-tab="main">Головна</button><button class="tab" data-tab="events">Журнал</button><button class="tab" data-tab="history">Історія</button><button class="tab" data-tab="system">Система</button></nav>
 <section id="panel-main" class="panel active">
 <div class="card source"><div><div class="label">Поточне джерело живлення (за входом адаптера)</div><strong id="powerSource">Визначення...</strong><small id="lastSwitch">Останнє перемикання: —</small></div><div id="adapterVoltage" class="muted">DC+: —</div></div>
 <div id="status" class="card notice muted">Очікування вимірювань...</div>
@@ -895,6 +895,11 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 <p class="foot">Графіки зберігаються лише в браузері. Без BMS вебмоніторинг не запобігає перерозряду. Джерело визначається за напругою DC+, а не положенням реле YX850.</p>
 </section>
 <section id="panel-events" class="panel"><h2>Журнал подій живлення</h2><p class="muted">≈ — приблизний час відключення, визначений після запуску ESP32 та синхронізації NTP.</p><div class="tablewrap"><table><thead><tr><th>Дата та час</th><th>Подія</th></tr></thead><tbody id="events"><tr><td colspan="2">Завантаження...</td></tr></tbody></table></div></section>
+<section id="panel-history" class="panel"><h2>Історія вимірювань (LittleFS)</h2><p class="muted">Усереднені показники приблизно кожні 5 хвилин. Графіки будуються за збереженим CSV, а не за пам'яттю браузера.</p>
+<div class="historycontrols"><button type="button" data-range="1" class="selected">1 година</button><button type="button" data-range="24">24 години</button><button type="button" data-range="168">7 днів</button><button type="button" id="reloadHistory">Оновити</button></div>
+<p id="historyStatus" class="muted" aria-live="polite">Відкрийте вкладку, щоб завантажити історію.</p>
+<div class="historycharts"><div class="card"><div class="label">Напруга акумулятора, В</div><canvas id="historicBattery" class="historychart"></canvas></div><div class="card"><div class="label">Струм, мА</div><canvas id="historicCurrent" class="historychart"></canvas></div><div class="card"><div class="label">Потужність, Вт</div><canvas id="historicPower" class="historychart"></canvas></div></div>
+<p class="foot">Проміжки без записів не означають нульове споживання. Після зміни періоду показуються лише наявні вимірювання.</p></section>
 <section id="panel-system" class="panel"><h2>Діагностика системи</h2><div class="systemgrid">
 <div class="card"><div class="label">Версія прошивки</div><div class="value" id="firmwareVersion">—</div></div>
 <div class="card"><div class="label">INA226</div><div class="value" id="inaState">—</div></div>
@@ -910,14 +915,57 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12p
 </div><p class="foot"><a href="/api/measurements" style="color:#80c7ff">Завантажити історію вимірювань (CSV)</a></p><h2>Попередження</h2><div id="alerts" class="card muted">Очікування даних...</div></section>
 </div><script>
 const $=id=>document.getElementById(id);
-let activeTab='main';let latestData=null;let events=[];
+let activeTab='main';let latestData=null;let events=[];let historicRows=[];let historicRangeHours=1;let historicLoaded=false;
 const history={v:[],i:[],p:[]};
-function setTab(tab){activeTab=tab;document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));if(tab==='main')drawCharts();if(tab==='events')updateEvents();}
+function setTab(tab){activeTab=tab;document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));if(tab==='main')drawCharts();if(tab==='events')updateEvents();if(tab==='history'){if(!historicLoaded)loadHistoricData();else drawHistoricCharts();}}
 document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.tab)));
 function add(k,v){if(!Number.isFinite(v))return;history[k].push(v);if(history[k].length>60)history[k].shift();}
 function line(canvas,values){if(!canvas.clientWidth||!canvas.clientHeight)return;const dpr=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);c.strokeStyle='#38516f';c.lineWidth=1;for(let j=1;j<4;j++){let y=h*j/4;c.beginPath();c.moveTo(8,y);c.lineTo(w-8,y);c.stroke();}if(!values.length)return;let lo=Math.min(...values),hi=Math.max(...values);if(hi-lo<0.1){lo-=0.05;hi+=0.05;}c.strokeStyle='#55b5ff';c.lineWidth=2;c.beginPath();values.forEach((v,j)=>{const x=9+j*(w-18)/Math.max(1,values.length-1),y=h-10-(v-lo)/(hi-lo)*(h-20);if(!j)c.moveTo(x,y);else c.lineTo(x,y);});c.stroke();c.fillStyle='#aec4df';c.font='12px system-ui';c.fillText(hi.toFixed(2),10,13);c.fillText(lo.toFixed(2),10,h-3);}
 function drawCharts(){line($('chartV'),history.v);line($('chartI'),history.i);line($('chartP'),history.p);}
-window.addEventListener('resize',()=>{if(activeTab==='main')drawCharts();});
+// History rendering uses the existing read-only CSV endpoint; no new flash writes.
+function historyDate(sec){return new Date(sec*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}
+async function loadHistoricData(){
+ const status=$('historyStatus');status.textContent='Завантаження історії...';
+ try{
+  const response=await fetch('/api/measurements',{cache:'no-store'});
+  if(!response.ok)throw Error('HTTP '+response.status);
+  const csv=await response.text();const rows=[];
+  for(const line of csv.split(/\r?\n/)){
+   if(!line||line.startsWith('timestamp,'))continue;
+   const c=line.trim().split(',');if(c.length<7)continue;
+   const t=Number(c[0]),battery=Number(c[3]),current=Number(c[5]),power=Number(c[6]);
+   if(Number.isFinite(t)&&t>0&&[battery,current,power].every(Number.isFinite))rows.push({t,battery,current,power});
+  }
+  historicRows=rows.sort((a,b)=>a.t-b.t);historicLoaded=true;drawHistoricCharts();
+ }catch(err){status.textContent='Не вдалося завантажити історію: '+err.message;console.error(err);}
+}
+function historicLine(canvas,rows,key,unit){
+ const w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;
+ const dpr=window.devicePixelRatio||1;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+ const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+ const left=58,right=12,top=20,bottom=33,pw=w-left-right,ph=h-top-bottom;
+ ctx.font='11px system-ui';ctx.strokeStyle='#38516f';ctx.fillStyle='#aec4df';ctx.lineWidth=1;
+ if(!rows.length){ctx.fillText('Немає даних за вибраний період',left,top+25);return;}
+ let min=Math.min(...rows.map(r=>r[key])),max=Math.max(...rows.map(r=>r[key]));
+ const margin=Math.max((max-min)*0.12,key==='battery'?0.025:key==='power'?0.05:1);min-=margin;max+=margin;
+ const start=Math.min(...rows.map(r=>r.t)),end=Math.max(...rows.map(r=>r.t));
+ for(let j=0;j<=3;j++){const y=top+ph*j/3;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillText((max-(max-min)*j/3).toFixed(key==='current'?0:2),4,y+4);}
+ const x=t=>left+(end===start?pw/2:(t-start)/(end-start)*pw),y=v=>top+(max-v)/(max-min)*ph;
+ ctx.strokeStyle='#55b5ff';ctx.lineWidth=2;ctx.beginPath();
+ rows.forEach((r,i)=>{if(i===0)ctx.moveTo(x(r.t),y(r[key]));else ctx.lineTo(x(r.t),y(r[key]));});ctx.stroke();
+ if(rows.length===1){ctx.fillStyle='#55b5ff';ctx.beginPath();ctx.arc(x(rows[0].t),y(rows[0][key]),3,0,Math.PI*2);ctx.fill();}
+ ctx.fillStyle='#aec4df';ctx.textAlign='left';ctx.fillText(historyDate(start),left,h-7);ctx.textAlign='right';ctx.fillText(historyDate(end),w-right,h-7);ctx.textAlign='left';
+}
+function drawHistoricCharts(){
+ const now=Math.floor(Date.now()/1000),cutoff=now-historicRangeHours*3600;
+ const rows=historicRows.filter(r=>r.t>=cutoff&&r.t<=now+120);
+ $('historyStatus').textContent=rows.length+' записів за '+(historicRangeHours===1?'1 годину':historicRangeHours===24?'24 години':'7 днів')+' (усього збережено: '+historicRows.length+').';
+ historicLine($('historicBattery'),rows,'battery','В');historicLine($('historicCurrent'),rows,'current','мА');historicLine($('historicPower'),rows,'power','Вт');
+}
+document.querySelectorAll('[data-range]').forEach(button=>button.addEventListener('click',()=>{historicRangeHours=Number(button.dataset.range);document.querySelectorAll('[data-range]').forEach(b=>b.classList.toggle('selected',b===button));if(historicLoaded)drawHistoricCharts();else loadHistoricData();}));
+$('reloadHistory').addEventListener('click',loadHistoricData);
+
+window.addEventListener('resize',()=>{if(activeTab==='main')drawCharts();if(activeTab==='history'&&historicLoaded)drawHistoricCharts();});
 function approxSOC(v){const p=[[3,0],[3.3,5],[3.5,10],[3.6,20],[3.7,35],[3.8,50],[3.9,65],[4,80],[4.1,92],[4.2,100]];if(v<=3)return 0;if(v>=4.2)return 100;for(let j=1;j<p.length;j++)if(v<=p[j][0]){let a=p[j-1],b=p[j];return Math.round(a[1]+(v-a[0])*(b[1]-a[1])/(b[0]-a[0]));}return 100;}
 function formatDate(sec){if(!(sec>0))return null;return new Date(sec*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});}
 function eventLabel(type){return type==='adapter_lost'?'Адаптер відключено — акумулятор':type==='adapter_restored'?'Адаптер підключено — мережа':type;}
@@ -928,7 +976,7 @@ async function update(){try{const r=await fetch('/api/data',{cache:'no-store'});
 const cellBox=$('cells');cellBox.replaceChildren();const vs=d.batteryValid?d.cells.slice(0,d.detectedCells):[];const imbalance=vs.length?Math.max(...vs)-Math.min(...vs):0;$('imbalance').textContent=vs.length?(imbalance*1000).toFixed(0)+' мВ':'—';if(vs.length){vs.forEach((v,i)=>{const el=tile('Комірка '+(i+1),v.toFixed(3)+' В',v<3.3||v>4.2);const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill'+(v<3.3||v>4.2?' warnfill':'');fill.style.width=Math.max(0,Math.min(100,v/4.2*100))+'%';track.appendChild(fill);el.appendChild(track);cellBox.appendChild(el);});}else cellBox.textContent='Немає підтверджених даних про комірки.';
 const tapBox=$('taps');tapBox.replaceChildren();d.taps.forEach((v,i)=>tapBox.appendChild(tile('B'+(i+1),v.toFixed(3)+' В')));
 const warnings=[];if(vs.some(v=>v<3.3))warnings.push('Низька напруга однієї або кількох комірок.');if(vs.some(v=>v>4.2))warnings.push('Напруга комірки перевищує 4,20 В.');if(imbalance>0.10)warnings.push('Різниця між комірками понад 100 мВ.');$('alerts').textContent=!d.batteryValid?'Перевір балансувальні канали.':warnings.length?warnings.join(' '):'Критичних відхилень за заданими порогами не виявлено.';
-$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.9-dev1';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('historyRecords').textContent=typeof d.measurementRecords==='number'?d.measurementRecords+' / 2016':'—';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
+$('firmwareVersion').textContent=d.firmwareVersion||'—';$('headerVersion').textContent=d.firmwareVersion||'v3.9-dev2';$('inaState').textContent=d.inaReady?'OK':'Помилка';$('inaState').className='value '+(d.inaReady?'ok':'warn');$('wifi').textContent=d.wifiConnected?d.wifiRSSI+' dBm':'Відключено';$('uptime').textContent=Math.floor(d.uptimeSeconds/3600)+' год '+Math.floor(d.uptimeSeconds%3600/60)+' хв';$('resetReason').textContent=d.resetReason||'—';$('freeHeap').textContent=typeof d.freeHeap==='number'?(d.freeHeap/1024).toFixed(1)+' КБ':'—';$('littlefs').textContent=d.littlefs_mounted?((d.littlefs_used/1024).toFixed(0)+' / '+(d.littlefs_total/1024).toFixed(0)+' КБ'):'Помилка';$('historyRecords').textContent=typeof d.measurementRecords==='number'?d.measurementRecords+' / 2016':'—';$('ntp').textContent=d.ntpSynced?'Синхронізовано':'Очікування';$('ota').textContent=d.otaReady?'Готово':'Очікування';$('buildDateTime').textContent=d.buildDate&&d.buildTime?d.buildDate+' '+d.buildTime:'—';if(d.inaReady){add('v',d.busVoltage);add('i',d.currentMA);add('p',d.powerMW/1000);if(activeTab==='main')drawCharts();}
 }catch(e){$('status').textContent='Втрачено зв’язок з ESP32';$('status').className='card notice danger';console.error(e);}}
 update();updateEvents();setInterval(update,3000);setInterval(updateEvents,10000);
 </script></body></html>
