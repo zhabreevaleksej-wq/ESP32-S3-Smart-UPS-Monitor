@@ -13,7 +13,14 @@ Experimental battery-backup monitoring for a Wi-Fi router and optical network un
 - Four-tab local web dashboard: Home / Events / Analytics / System (UI text is Ukrainian).
 - Live electrical measurements, Li-ion cell-voltage monitoring through voltage dividers, 1-hour/24-hour/7-day history charts, energy counters, and saved outage events.
 - Telegram bot: `/start`, `/status`, `/battery`, `/schedule`, `/help`, plus adapter loss/return alerts and a stored notification queue.
-- A schedule feed currently targets **Poltava region, queue 1.2**, via a third-party unofficial source; it must be adapted for other regions. Automated 60/15-minute reminders are implemented but have not been separately validated in real time.
+- A schedule feed currently targets **Poltava region, queue 1.2**, via a third-party unofficial source; it must be adapted for other regions. 60/15-minute Telegram reminders were not separately validated at release, but actual reminders were received before several scheduled outages on 22–23 November 2026; this does not guarantee every future notification.
+
+
+## Field observations (22–23 November 2026)
+
+Five adapter-loss/return episodes were matched between Telegram messages and the local events journal. The sum of the **intervals between the recorded timestamps** was **9 h 7 min 37 s**; this is **not** a precise grid-outage duration, an ampere-hour capacity measurement, or proof of 9 hours of uninterrupted battery runtime. The controller may restart during switching. On one observed return to adapter power (22 November, about 19:02), the router and ONU remained on without a noticeable reboot; seamless transfer is not guaranteed.
+
+A 23 November 3S voltage comparison yielded **12.520 V (multimeter)** versus **12.550 V (dashboard)**, with cell differences of **+3 / +33 / −6 mV** (dashboard minus meter). No calibration changes were made. A cumulative battery-runtime test during naturally occurring outages is still ongoing; there is no verified capacity or completed autonomy result. Read the [field-test report (Ukrainian)](docs/FIELD_TEST_2026-11-22_23.md) for timestamps and limitations.
 
 ## Requirements and installation
 
